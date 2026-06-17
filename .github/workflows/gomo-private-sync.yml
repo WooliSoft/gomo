@@ -130,6 +130,7 @@ jobs:
 
           copybara_args=(
             migrate
+            --ignore-noop
             --git-committer-name="github-actions[bot]"
             --git-committer-email="41898282+github-actions[bot]@users.noreply.github.com"
           )
