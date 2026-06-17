@@ -147,6 +147,16 @@ jobs:
             copybara_args+=(--force)
           fi
 
+          set +e
           copybara "${copybara_args[@]}" \
             copy.bara.sky \
             "$workflow"
+          copybara_status=$?
+          set -e
+
+          if [ "$copybara_status" -eq 4 ]; then
+            echo "Copybara found no changes to sync."
+            exit 0
+          fi
+
+          exit "$copybara_status"
