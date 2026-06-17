@@ -1,6 +1,13 @@
 {
   description = "Gomo, monorepo tooling for Gleam packages";
 
+  nixConfig = {
+    extra-substituters = ["https://gomo.cachix.org"];
+    extra-trusted-public-keys = [
+      "gomo.cachix.org-1:caU+N40akKkMLsv/G1IiUekhIwh7d6IlKcLRGiJqzv0="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   };
