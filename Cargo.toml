@@ -1,0 +1,27 @@
+[package]
+name = "gomo"
+version = "1.1.0"
+edition = "2024"
+description = "Monorepo tooling for Gleam packages"
+
+[dependencies]
+anyhow = "1.0.102"
+blake3 = "1.8.2"
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6.5"
+crossterm = "0.29.0"
+futures = "0.3.32"
+git2 = "0.21.0"
+globset = "0.4.18"
+jj-lib = "0.41.0"
+ratatui = { version = "0.30.0", default-features = false, features = [
+  "crossterm",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+shell-words = "1.1.1"
+tar = "0.4.44"
+tokio = { version = "1.52.2", features = ["rt"] }
+toml = "1.1.2"
+walkdir = "2.5.0"
+zstd = "0.13.3"

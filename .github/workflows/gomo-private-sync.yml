@@ -1,0 +1,140 @@
+name: Sync Gomo Private Repo
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - .github/**
+      - copy.bara.sky
+      - target/**
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to import from WooliSoft/gomo and push to WooliSoft/wooli.
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - master
+      force:
+        description: Force the migration. Use for bootstrap with last_rev.
+        required: false
+        default: false
+        type: boolean
+      last_rev:
+        description: Optional public baseline commit. Copybara imports commits after this revision.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gomo-private-sync-${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      COPYBARA_VERSION: v20260615
+      COPYBARA_SHA256: ae76963bd36a6f889970b3b6bdc064ac9fbf5ab21c5971fbf334dee893df754d
+      FORCE_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+      LAST_REV: ${{ github.event_name == 'workflow_dispatch' && inputs.last_rev || '' }}
+
+    steps:
+      - uses: actions/checkout@v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Copybara
+        run: |
+          set -euo pipefail
+
+          copybara_jar="$RUNNER_TEMP/copybara_deploy.jar"
+          copybara_bin="$RUNNER_TEMP/bin/copybara"
+
+          curl --fail --location --silent --show-error \
+            --output "$copybara_jar" \
+            "https://github.com/google/copybara/releases/download/${COPYBARA_VERSION}/copybara_deploy.jar"
+
+          printf '%s  %s\n' "$COPYBARA_SHA256" "$copybara_jar" | sha256sum --check -
+
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$copybara_bin" <<EOF
+          #!/usr/bin/env bash
+          exec java -jar "$copybara_jar" "\$@"
+          EOF
+          chmod +x "$copybara_bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Configure private repo SSH key
+        env:
+          GOMO_PRIVATE_SYNC_SSH_KEY: ${{ secrets.GOMO_PRIVATE_SYNC_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GOMO_PRIVATE_SYNC_SSH_KEY" ]; then
+            echo "Missing GOMO_PRIVATE_SYNC_SSH_KEY secret" >&2
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$GOMO_PRIVATE_SYNC_SSH_KEY" > "$HOME/.ssh/gomo_private_sync"
+          chmod 600 "$HOME/.ssh/gomo_private_sync"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+
+      - name: Sync gomo to private repo
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/gomo_private_sync -o IdentitiesOnly=yes
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            branch="${{ inputs.branch }}"
+          else
+            branch="$GITHUB_REF_NAME"
+          fi
+
+          case "$branch" in
+            main|master)
+              workflow="gomo_public_to_private_${branch}"
+              ;;
+            *)
+              echo "Unsupported branch: $branch" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ -n "$LAST_REV" ] && [ "$FORCE_MIGRATION" != "true" ]; then
+            echo "Bootstrap migrations require force=true." >&2
+            exit 1
+          fi
+
+          copybara_args=(
+            migrate
+            --git-committer-name="github-actions[bot]"
+            --git-committer-email="41898282+github-actions[bot]@users.noreply.github.com"
+          )
+
+          if [ -n "$LAST_REV" ]; then
+            copybara_args+=(--last-rev "$LAST_REV")
+          fi
+
+          if [ "$FORCE_MIGRATION" = "true" ]; then
+            copybara_args+=(--force)
+          fi
+
+          copybara "${copybara_args[@]}" \
+            copy.bara.sky \
+            "$workflow"

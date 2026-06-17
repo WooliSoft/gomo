@@ -1,0 +1,52 @@
+PUBLIC_REPO_URL = "https://github.com/WooliSoft/gomo.git"
+PRIVATE_REPO_SSH_URL = "git@github.com:WooliSoft/wooli.git"
+
+BOT_AUTHOR = "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+
+
+def _skip_synced_from_private(ctx):
+    if ctx.find_label("Gomo-Private-RevId"):
+        core.fail_with_noop("Skipping commit that originated from WooliSoft/wooli.")
+
+
+def gomo_public_to_private_workflow(name, branch):
+    core.workflow(
+        name = name,
+        origin = git.origin(
+            url = PUBLIC_REPO_URL,
+            ref = branch,
+        ),
+        destination = git.destination(
+            url = PRIVATE_REPO_SSH_URL,
+            fetch = branch,
+            push = branch,
+        ),
+        origin_files = glob(
+            ["**"],
+            exclude = [
+                ".github/**",
+                "copy.bara.sky",
+                "target/**",
+            ],
+        ),
+        destination_files = glob(
+            ["tools/gomo/**"],
+            exclude = [
+                "tools/gomo/.github/**",
+                "tools/gomo/copy.bara.sky",
+                "tools/gomo/target/**",
+            ],
+        ),
+        authoring = authoring.pass_thru(BOT_AUTHOR),
+        mode = "ITERATIVE",
+        reversible_check = True,
+        custom_rev_id = "Gomo-Public-RevId",
+        transformations = [
+            core.dynamic_transform(impl = _skip_synced_from_private),
+            core.move("", "tools/gomo"),
+        ],
+    )
+
+
+gomo_public_to_private_workflow("gomo_public_to_private_main", "main")
+gomo_public_to_private_workflow("gomo_public_to_private_master", "master")
