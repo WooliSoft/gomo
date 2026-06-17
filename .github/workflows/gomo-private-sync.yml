@@ -44,7 +44,9 @@ jobs:
       COPYBARA_VERSION: v20260615
       COPYBARA_SHA256: ae76963bd36a6f889970b3b6bdc064ac9fbf5ab21c5971fbf334dee893df754d
       FORCE_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+      HEAD_COMMIT_FROM_PRIVATE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'Gomo-Private-RevId:') || false }}
       LAST_REV: ${{ github.event_name == 'workflow_dispatch' && inputs.last_rev || '' }}
+      PUSH_LAST_REV: ${{ github.event_name == 'push' && github.event.before || '' }}
 
     steps:
       - uses: actions/checkout@v6.0.3
@@ -106,6 +108,11 @@ jobs:
             branch="$GITHUB_REF_NAME"
           fi
 
+          if [ "$HEAD_COMMIT_FROM_PRIVATE" = "true" ]; then
+            echo "Skipping commit that originated from WooliSoft/wooli."
+            exit 0
+          fi
+
           case "$branch" in
             main|master)
               workflow="gomo_public_to_private_${branch}"
@@ -126,6 +133,10 @@ jobs:
             --git-committer-name="github-actions[bot]"
             --git-committer-email="41898282+github-actions[bot]@users.noreply.github.com"
           )
+
+          if [ -z "$LAST_REV" ] && [ -n "$PUSH_LAST_REV" ] && ! [[ "$PUSH_LAST_REV" =~ ^0+$ ]]; then
+            copybara_args+=(--last-rev "$PUSH_LAST_REV" --force)
+          fi
 
           if [ -n "$LAST_REV" ]; then
             copybara_args+=(--last-rev "$LAST_REV")
