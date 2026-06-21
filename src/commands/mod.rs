@@ -20,6 +20,7 @@ pub(crate) struct OutputOptions {
     pub(crate) json: bool,
     pub(crate) ci: bool,
     pub(crate) tui: bool,
+    pub(crate) terminal_width: Option<u16>,
 }
 
 impl CommandOutput {

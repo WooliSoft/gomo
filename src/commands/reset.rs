@@ -128,6 +128,7 @@ version = "0.1.0"
                 json: true,
                 ci: true,
                 tui: false,
+                terminal_width: None,
             },
         )
         .expect("JSON reset should succeed");

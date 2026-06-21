@@ -17,7 +17,7 @@ pub(crate) fn run(cwd: &Path, output_options: OutputOptions) -> Result<CommandOu
     } else if output_options.ci {
         ui::projects::render_plain(&workspace)
     } else {
-        ui::projects::render(&workspace)
+        ui::projects::render(&workspace, output_options.terminal_width)
     };
 
     Ok(CommandOutput::success(output))

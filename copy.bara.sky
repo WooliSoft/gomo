@@ -43,6 +43,7 @@ def gomo_public_to_private_workflow(name, branch):
         custom_rev_id = "Gomo-Public-RevId",
         transformations = [
             core.dynamic_transform(impl = _skip_synced_from_private),
+            metadata.use_last_change(author = False, message = True),
             core.move("", "tools/gomo"),
         ],
     )

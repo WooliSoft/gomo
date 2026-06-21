@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{Args, ColorChoice, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::env;
 use std::io::IsTerminal;
@@ -9,8 +10,23 @@ use std::path::{Path, PathBuf};
 use crate::commands::{self, CommandOutput, OutputOptions};
 use crate::runner::{CommandOptions, Target};
 
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Yellow.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .invalid(AnsiColor::Red.on_default().effects(Effects::BOLD));
+
 #[derive(Debug, Parser)]
-#[command(name = "gomo", version, about = "Monorepo tooling for Gleam packages")]
+#[command(
+    name = "gomo",
+    version,
+    about = "Monorepo tooling for Gleam packages",
+    color = ColorChoice::Always,
+    styles = HELP_STYLES
+)]
 struct Cli {
     /// Force commands to run without reading from or writing to the local cache.
     #[arg(long, global = true)]
@@ -186,6 +202,7 @@ fn execute_from_with_tui(cli: Cli, cwd: &Path, auto_tui: bool) -> Result<Command
         json: cli.json,
         ci: cli.ci || cli.json,
         tui: auto_tui && !cli.ci && !cli.json,
+        terminal_width: terminal_width(auto_tui && !cli.ci && !cli.json),
     };
 
     match cli.command {
@@ -293,14 +310,26 @@ fn execute_from_with_tui(cli: Cli, cwd: &Path, auto_tui: bool) -> Result<Command
             output_options,
         ),
         Some(Commands::Completions { shell }) => generate_completions(shell),
-        None => Ok(CommandOutput::success(
-            Cli::command().render_help().to_string(),
-        )),
+        None => {
+            let mut command = Cli::command();
+            let help = command.render_help();
+            Ok(CommandOutput::success(help.ansi().to_string()))
+        }
     }
 }
 
 fn should_auto_tui() -> bool {
     io::stdout().is_terminal() && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+}
+
+fn terminal_width(enabled: bool) -> Option<u16> {
+    if !enabled {
+        return None;
+    }
+
+    crossterm::terminal::size()
+        .ok()
+        .map(|(width, _height)| width)
 }
 
 fn run_shorthand(
@@ -404,22 +433,24 @@ mod tests {
     #[test]
     fn prints_help_with_no_args() {
         let stdout = execute_args(&[]).expect("no args should render help");
+        let visible = strip_ansi(&stdout);
 
-        assert!(stdout.contains("Usage:"));
-        assert!(stdout.contains("affected"));
-        assert!(stdout.contains("build"));
-        assert!(stdout.contains("clean"));
-        assert!(stdout.contains("completions"));
-        assert!(stdout.contains("deps"));
-        assert!(stdout.contains("doctor"));
-        assert!(stdout.contains("explain"));
-        assert!(stdout.contains("format"));
-        assert!(stdout.contains("graph"));
-        assert!(stdout.contains("projects"));
-        assert!(stdout.contains("reset"));
-        assert!(stdout.contains("run"));
-        assert!(stdout.contains("run-many"));
-        assert!(stdout.contains("test"));
+        assert!(stdout.contains("\x1b["));
+        assert!(visible.contains("Usage:"));
+        assert!(visible.contains("affected"));
+        assert!(visible.contains("build"));
+        assert!(visible.contains("clean"));
+        assert!(visible.contains("completions"));
+        assert!(visible.contains("deps"));
+        assert!(visible.contains("doctor"));
+        assert!(visible.contains("explain"));
+        assert!(visible.contains("format"));
+        assert!(visible.contains("graph"));
+        assert!(visible.contains("projects"));
+        assert!(visible.contains("reset"));
+        assert!(visible.contains("run"));
+        assert!(visible.contains("run-many"));
+        assert!(visible.contains("test"));
     }
 
     #[test]
@@ -447,13 +478,12 @@ mod tests {
     #[test]
     fn prints_help_with_flag() {
         let error = Cli::try_parse_from(["gomo", "--help"]).expect_err("help exits through clap");
+        let rendered = error.render().ansi().to_string();
+        let visible = strip_ansi(&rendered);
 
         assert_eq!(error.kind(), ErrorKind::DisplayHelp);
-        assert!(
-            error
-                .to_string()
-                .contains("Usage: gomo [OPTIONS] [COMMAND]")
-        );
+        assert!(rendered.contains("\x1b["));
+        assert!(visible.contains("Usage: gomo [OPTIONS] [COMMAND]"));
     }
 
     #[test]
@@ -466,6 +496,25 @@ mod tests {
             error.to_string(),
             format!("gomo {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut stripped = String::new();
+        let mut chars = text.chars();
+
+        while let Some(char) = chars.next() {
+            if char == '\x1b' {
+                for escaped in chars.by_ref() {
+                    if escaped == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(char);
+            }
+        }
+
+        stripped
     }
 
     #[test]

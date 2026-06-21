@@ -53,6 +53,7 @@
         cargoLock.lockFile = ./Cargo.lock;
 
         nativeBuildInputs = [
+          pkgs.installShellFiles
           pkgs.pkg-config
         ];
 
@@ -64,6 +65,13 @@
           pkgs.zlib
           pkgs.zstd
         ] ++ darwinFrameworks;
+
+        postInstall = ''
+          installShellCompletion --cmd gomo \
+            --bash <($out/bin/gomo completions bash) \
+            --fish <($out/bin/gomo completions fish) \
+            --zsh <($out/bin/gomo completions zsh)
+        '';
 
         meta = {
           description = cargoToml.package.description;

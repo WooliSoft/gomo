@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -11,10 +12,10 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 
 use crate::commands::run::{TaskCacheStatus, TaskOutcome, TaskStatus, TaskSummary};
@@ -158,9 +159,12 @@ impl RunManyTerminal {
 
     pub(crate) fn finish(&mut self, summary: &TaskSummary) -> io::Result<RunManyExit> {
         self.summary = Some(summary.clone());
-        self.exit_prompt = Some(ExitPrompt::Countdown {
-            deadline: Instant::now() + Duration::from_secs(3),
-        });
+        self.draw()?;
+        if is_agent_environment() {
+            self.restore()?;
+            return Ok(RunManyExit::AutoExited);
+        }
+        self.exit_prompt = Some(ExitPrompt::Cancelled);
         self.draw()?;
         let exit = self.wait_for_exit_confirmation()?;
         self.restore()?;
@@ -229,38 +233,13 @@ impl RunManyTerminal {
 
     fn wait_for_exit_confirmation(&mut self) -> io::Result<RunManyExit> {
         loop {
-            if let Some(ExitPrompt::Countdown { deadline }) = self.exit_prompt {
-                if Instant::now() >= deadline {
-                    return Ok(RunManyExit::AutoExited);
-                }
-            }
-
-            let poll_timeout = match self.exit_prompt {
-                Some(ExitPrompt::Countdown { deadline }) => deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(100)),
-                Some(ExitPrompt::Cancelled) | None => Duration::from_millis(250),
-            };
-
-            if event::poll(poll_timeout)? {
+            if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(key) = event::read()? {
-                    if matches!(self.exit_prompt, Some(ExitPrompt::Countdown { .. })) {
-                        if key.code == KeyCode::Enter {
-                            return Ok(RunManyExit::UserExited);
-                        }
-
-                        self.exit_prompt = Some(ExitPrompt::Cancelled);
-                        self.draw()?;
-                        continue;
-                    }
-
                     if self.handle_key(key.code) {
                         return Ok(RunManyExit::UserExited);
                     }
                     self.draw()?;
                 }
-            } else if matches!(self.exit_prompt, Some(ExitPrompt::Countdown { .. })) {
-                self.draw()?;
             }
         }
     }
@@ -290,17 +269,9 @@ impl RunManyTerminal {
             KeyCode::Char('q') if self.summary.is_some() => return true,
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 self.fullscreen_logs = !self.fullscreen_logs;
-                if self.fullscreen_logs
-                    && matches!(self.exit_prompt, Some(ExitPrompt::Countdown { .. }))
-                {
-                    self.exit_prompt = Some(ExitPrompt::Cancelled);
-                }
             }
             KeyCode::Esc if self.fullscreen_logs => {
                 self.fullscreen_logs = false;
-            }
-            KeyCode::Esc if matches!(self.exit_prompt, Some(ExitPrompt::Countdown { .. })) => {
-                self.exit_prompt = Some(ExitPrompt::Cancelled);
             }
             KeyCode::Esc if self.summary.is_some() => return true,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -366,9 +337,14 @@ enum TaskRowStatus {
     Skipped,
 }
 
+fn is_agent_environment() -> bool {
+    env::var("AGENT").is_ok_and(|v| v == "1")
+        || env::var("OPENCODE").is_ok_and(|v| v == "1")
+        || env::var("CODEX_CI").is_ok_and(|v| v == "1")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitPrompt {
-    Countdown { deadline: Instant },
     Cancelled,
 }
 
@@ -425,10 +401,6 @@ fn render(frame: &mut Frame<'_>, app: &RunManyTerminal) {
 
     render_body(frame, outer[0], app);
     render_run_summary(frame, outer[1], app);
-
-    if let Some(ExitPrompt::Countdown { deadline }) = app.exit_prompt {
-        render_exit_modal(frame, frame.area(), deadline);
-    }
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
@@ -879,58 +851,11 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
     frame.render_widget(summary, area);
 }
 
-fn render_exit_modal(frame: &mut Frame<'_>, area: Rect, deadline: Instant) {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let seconds = remaining.as_secs() + u64::from(remaining.subsec_millis() > 0);
-    let modal_area = centered_rect(58, 9, area);
-    let lines = vec![
-        Line::from(vec![styled("Exit Gomo?", Color::White, Modifier::BOLD)]),
-        Line::from(""),
-        Line::from(vec![
-            raw("Auto-exiting in "),
-            styled(format!("{seconds}s"), Color::Cyan, Modifier::BOLD),
-            raw("."),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            styled("Enter", Color::Green, Modifier::BOLD),
-            raw(" exits now"),
-        ]),
-        Line::from(vec![
-            styled("Any other key", Color::Yellow, Modifier::BOLD),
-            raw(" closes this dialog"),
-        ]),
-    ];
-    let modal = Paragraph::new(lines)
-        .block(
-            Block::bordered()
-                .title(" Finished ")
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(Color::Cyan)),
-        )
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
 fn key_hint(app: &RunManyTerminal) -> &'static str {
-    match (app.summary.is_some(), app.exit_prompt) {
-        (true, Some(ExitPrompt::Cancelled)) => "↑/↓ tasks, Enter/L logs, Esc/q exits",
-        (true, _) => "Enter exits, any other key closes dialog",
-        (false, _) => "↑/↓ or j/k select tasks, L logs",
+    if app.summary.is_some() {
+        "↑/↓ tasks, Enter/L logs, Esc/q exits"
+    } else {
+        "↑/↓ or j/k select tasks, L logs"
     }
 }
 

@@ -9,6 +9,14 @@ use crate::dependency_versions;
 use crate::graph::ProjectGraph;
 use crate::workspace::{self, Workspace};
 
+const DEFAULT_RICH_WIDTH: usize = 100;
+const RESET: &str = "\x1b[0m";
+const BOLD_CYAN: &str = "\x1b[1;36m";
+const BOLD_GREEN: &str = "\x1b[1;32m";
+const BOLD_RED: &str = "\x1b[1;31m";
+const BOLD_YELLOW: &str = "\x1b[1;33m";
+const DIM_GRAY: &str = "\x1b[2;90m";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DoctorReport {
     status: String,
@@ -30,8 +38,10 @@ pub(crate) fn run(cwd: &Path, output_options: OutputOptions) -> Result<CommandOu
     let exit_code = if report.has_errors() { 1 } else { 0 };
     let output = if output_options.json {
         render_json(&report)?
+    } else if output_options.ci {
+        render_plain(&report)
     } else {
-        render_human(&report)
+        render_rich(&report, output_options.terminal_width)
     };
 
     Ok(CommandOutput::with_exit_code(output, exit_code))
@@ -175,7 +185,7 @@ fn check_graph(report: &mut DoctorReport, workspace: &Workspace) {
     }
 }
 
-fn render_human(report: &DoctorReport) -> String {
+fn render_plain(report: &DoctorReport) -> String {
     let mut output = String::new();
     output.push_str("Doctor\n");
     output.push_str(&format!("Status: {}\n", report.status));
@@ -195,6 +205,198 @@ fn render_human(report: &DoctorReport) -> String {
     }
 
     output
+}
+
+fn render_rich(report: &DoctorReport, terminal_width: Option<u16>) -> String {
+    let width = terminal_width
+        .map(usize::from)
+        .unwrap_or(DEFAULT_RICH_WIDTH)
+        .max(1);
+    let mut output = String::new();
+
+    push_border_line(&mut output, '╭', '─', '╮', width);
+    push_bordered_line(&mut output, "Doctor", width, Some(BOLD_CYAN));
+    push_separator_line(&mut output, width);
+    push_bordered_line(
+        &mut output,
+        &format!("Status: {}", report.status),
+        width,
+        Some(status_style(&report.status)),
+    );
+    if let Some(workspace_root) = &report.workspace_root {
+        push_wrapped_bordered_line(
+            &mut output,
+            &format!("Workspace Root: {workspace_root}"),
+            width,
+            None,
+        );
+    }
+    if let Some(cache_dir) = &report.cache_dir {
+        push_wrapped_bordered_line(&mut output, &format!("Cache Dir: {cache_dir}"), width, None);
+    }
+    push_bordered_line(
+        &mut output,
+        &format!("Projects: {}", report.project_count),
+        width,
+        None,
+    );
+
+    if !report.checks.is_empty() {
+        push_separator_line(&mut output, width);
+    }
+
+    for check in &report.checks {
+        push_wrapped_bordered_line(
+            &mut output,
+            &format!("[{}] {}: {}", check.status, check.name, check.message),
+            width,
+            Some(status_style(&check.status)),
+        );
+    }
+
+    push_border_line(&mut output, '╰', '─', '╯', width);
+    output
+}
+
+fn status_style(status: &str) -> &'static str {
+    match status {
+        "ok" => BOLD_GREEN,
+        "warning" => BOLD_YELLOW,
+        "error" => BOLD_RED,
+        _ => BOLD_CYAN,
+    }
+}
+
+fn content_width(width: usize) -> usize {
+    width.saturating_sub(4)
+}
+
+fn push_border_line(output: &mut String, left: char, fill: char, right: char, width: usize) {
+    if width < 2 {
+        output.push_str(&truncate(&left.to_string(), width));
+        output.push('\n');
+        return;
+    }
+
+    output.push_str(DIM_GRAY);
+    output.push(left);
+    output.push_str(&fill.to_string().repeat(width.saturating_sub(2)));
+    output.push(right);
+    output.push_str(RESET);
+    output.push('\n');
+}
+
+fn push_separator_line(output: &mut String, width: usize) {
+    push_border_line(output, '├', '─', '┤', width);
+}
+
+fn push_bordered_line(output: &mut String, text: &str, width: usize, style: Option<&str>) {
+    if width < 4 {
+        output.push_str(&truncate(text, width));
+        output.push('\n');
+        return;
+    }
+
+    let content_width = content_width(width);
+    let content = truncate(text, content_width);
+    let padding = content_width.saturating_sub(content.chars().count());
+
+    output.push_str(DIM_GRAY);
+    output.push('│');
+    output.push(' ');
+    output.push_str(RESET);
+    if let Some(style) = style {
+        output.push_str(style);
+        output.push_str(&content);
+        output.push_str(RESET);
+    } else {
+        output.push_str(&content);
+    }
+    output.push_str(&" ".repeat(padding));
+    output.push_str(DIM_GRAY);
+    output.push(' ');
+    output.push('│');
+    output.push_str(RESET);
+    output.push('\n');
+}
+
+fn push_wrapped_bordered_line(output: &mut String, text: &str, width: usize, style: Option<&str>) {
+    if width < 4 {
+        push_bordered_line(output, text, width, style);
+        return;
+    }
+
+    for line in wrap_text(text, content_width(width)) {
+        push_bordered_line(output, &line, width, style);
+    }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    for word in text.split_whitespace() {
+        let word_width = word.chars().count();
+
+        if word_width > width {
+            if !line.is_empty() {
+                lines.push(line);
+                line = String::new();
+            }
+            split_long_word(word, width, &mut lines, &mut line);
+            continue;
+        }
+
+        let next_width = if line.is_empty() {
+            word_width
+        } else {
+            line.chars().count() + 1 + word_width
+        };
+
+        if next_width <= width {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        } else {
+            lines.push(line);
+            line = word.to_string();
+        }
+    }
+
+    if !line.is_empty() {
+        lines.push(line);
+    }
+
+    lines
+}
+
+fn split_long_word(word: &str, width: usize, lines: &mut Vec<String>, line: &mut String) {
+    for char in word.chars() {
+        if line.chars().count() == width {
+            lines.push(std::mem::take(line));
+        }
+        line.push(char);
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+
+    if width <= 3 {
+        return text.chars().take(width).collect();
+    }
+
+    let mut truncated = text.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn render_json(report: &DoctorReport) -> Result<String> {
@@ -261,11 +463,16 @@ version = "0.1.0"
 
         let output = run(test_workspace.path(), OutputOptions::default())
             .expect("doctor should inspect workspace");
+        let visible = strip_ansi(&output.stdout);
 
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("Doctor"));
-        assert!(output.stdout.contains("Status: ok"));
-        assert!(output.stdout.contains("[ok] dependency graph"));
+        assert!(output.stdout.contains("\x1b[1;36m"));
+        assert!(output.stdout.contains("\x1b[1;32m"));
+        assert!(visible.contains("╭"));
+        assert!(visible.contains("Status: ok"));
+        assert!(visible.contains("[ok] dependency graph"));
+        assert_lines_fit(&output.stdout, DEFAULT_RICH_WIDTH);
     }
 
     #[test]
@@ -274,10 +481,44 @@ version = "0.1.0"
 
         let output = run(test_workspace.path(), OutputOptions::default())
             .expect("doctor should render discovery errors");
+        let visible = strip_ansi(&output.stdout);
 
         assert_eq!(output.exit_code, 1);
-        assert!(output.stdout.contains("[error] workspace discovery"));
-        assert!(output.stdout.contains("add gomo.toml"));
+        assert!(output.stdout.contains("\x1b[1;31m"));
+        assert!(visible.contains("[error] workspace discovery"));
+        assert!(visible.contains("add gomo.toml"));
+        assert_lines_fit(&output.stdout, DEFAULT_RICH_WIDTH);
+    }
+
+    #[test]
+    fn doctor_ci_output_stays_plain() {
+        let test_workspace = TestWorkspace::new("gomo-doctor-command-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+
+        let output = run(
+            test_workspace.path(),
+            OutputOptions {
+                json: false,
+                ci: true,
+                tui: false,
+                terminal_width: None,
+            },
+        )
+        .expect("doctor should render plain CI output");
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Doctor"));
+        assert!(output.stdout.contains("Status: ok"));
+        assert!(output.stdout.contains("[ok] dependency graph"));
+        assert!(!output.stdout.contains("\x1b["));
+        assert!(!output.stdout.contains("╭"));
     }
 
     #[test]
@@ -298,6 +539,7 @@ version = "0.1.0"
                 json: true,
                 ci: true,
                 tui: false,
+                terminal_width: None,
             },
         )
         .expect("doctor JSON should render");
@@ -335,5 +577,44 @@ version = "0.1.0"
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.contains("[error] dependency versions"));
         assert!(output.stdout.contains("gomo deps check"));
+    }
+
+    fn assert_lines_fit(output: &str, width: usize) {
+        for line in output.lines() {
+            assert!(
+                visible_width(line) <= width,
+                "line should fit {width} columns: {line:?}"
+            );
+        }
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        text.lines()
+            .map(strip_ansi_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn visible_width(line: &str) -> usize {
+        strip_ansi_line(line).chars().count()
+    }
+
+    fn strip_ansi_line(line: &str) -> String {
+        let mut stripped = String::new();
+        let mut chars = line.chars();
+
+        while let Some(char) = chars.next() {
+            if char == '\x1b' {
+                for escaped in chars.by_ref() {
+                    if escaped == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(char);
+            }
+        }
+
+        stripped
     }
 }
