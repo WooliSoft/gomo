@@ -96,6 +96,9 @@ command = "mise exec -- gleam format"
 command = "mise exec -- gleam format --check"
 ```
 
+Custom commands run through `sh`, so shell syntax such as `&&`, pipes,
+redirects, quoting, and environment variable expansion is supported.
+
 Default commands are `gleam build`, `gleam test`, `gleam format`, and
 `gleam format --check`. Custom format commands must be configured as a pair:
 if `[tools.gomo.format].command` is set, `[tools.gomo.format.check].command`
@@ -114,8 +117,9 @@ gomo deps check --json
 ```
 
 For Hex packages, the same dependency name must resolve to one version across
-all checked manifests. For local packages, Gomo also verifies that the locked
-local version matches the referenced local package's `gleam.toml` version.
+all checked manifests. Git packages must resolve to the same version, repository
+URL, and commit. For local packages, Gomo also verifies that the locked local
+version matches the referenced local package's `gleam.toml` version.
 
 Automatic `doctor` enforcement is controlled from root `gomo.toml`:
 

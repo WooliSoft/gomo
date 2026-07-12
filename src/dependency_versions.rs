@@ -42,6 +42,10 @@ pub(crate) struct VersionMismatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VersionGroup {
     pub(crate) version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) commit: Option<String>,
     pub(crate) occurrences: Vec<DependencyOccurrence>,
 }
 
@@ -69,6 +73,13 @@ struct DependencyKey {
     source: LockedPackageSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolutionKey {
+    version: String,
+    repo: Option<String>,
+    commit: Option<String>,
+}
+
 /// Check resolved package versions across all discovered workspace projects.
 pub(crate) fn check_workspace(
     workspace: &Workspace,
@@ -85,7 +96,7 @@ pub(crate) fn check_workspace(
         local_version_mismatches: Vec::new(),
     };
     let mut grouped_versions =
-        BTreeMap::<DependencyKey, BTreeMap<String, Vec<DependencyOccurrence>>>::new();
+        BTreeMap::<DependencyKey, BTreeMap<ResolutionKey, Vec<DependencyOccurrence>>>::new();
 
     for project in &workspace.projects {
         let lock_manifest_path = project.root.join("manifest.toml");
@@ -116,13 +127,18 @@ pub(crate) fn check_workspace(
                 continue;
             }
 
+            let is_git = is_git_package(&package);
             grouped_versions
                 .entry(DependencyKey {
                     name: package.name.clone(),
                     source: package.source.clone(),
                 })
                 .or_default()
-                .entry(package.version.clone())
+                .entry(ResolutionKey {
+                    version: package.version.clone(),
+                    repo: if is_git { package.repo.clone() } else { None },
+                    commit: if is_git { package.commit.clone() } else { None },
+                })
                 .or_default()
                 .push(DependencyOccurrence {
                     project: project.name.clone(),
@@ -150,10 +166,12 @@ pub(crate) fn check_workspace(
             source: key.source.to_string(),
             versions: versions
                 .into_iter()
-                .map(|(version, mut occurrences)| {
+                .map(|(resolution, mut occurrences)| {
                     occurrences.sort_by(|left, right| left.project.cmp(&right.project));
                     VersionGroup {
-                        version,
+                        version: resolution.version,
+                        repo: resolution.repo,
+                        commit: resolution.commit,
                         occurrences,
                     }
                 })
@@ -163,6 +181,10 @@ pub(crate) fn check_workspace(
 
     report.finish();
     report
+}
+
+fn is_git_package(package: &LockedPackage) -> bool {
+    package.source.as_str() == "git"
 }
 
 fn should_skip_package(package: &LockedPackage, config: &DependencyVersionConfig) -> bool {
@@ -430,6 +452,74 @@ packages = [
         assert_eq!(report.version_mismatches.len(), 1);
         assert_eq!(report.version_mismatches[0].dependency, "gleam_stdlib");
         assert_eq!(report.version_mismatches[0].source, "hex");
+    }
+
+    #[test]
+    fn accepts_matching_git_resolutions() {
+        let test_workspace = TestWorkspace::new("gomo-dependency-versions-git-test");
+        test_workspace.write_gomo_config();
+        for project in ["one", "two"] {
+            test_workspace.write_manifest(
+                &format!("apps/{project}"),
+                &format!("name = \"{project}\"\nversion = \"0.1.0\"\n"),
+            );
+            test_workspace.write_file(
+                &format!("apps/{project}/manifest.toml"),
+                r#"
+packages = [
+  { name = "lustre", version = "5.7.0", source = "git", repo = "https://github.com/lustre-labs/lustre", commit = "abc123" },
+]
+"#,
+            );
+        }
+        let workspace = crate::workspace::discover(test_workspace.path())
+            .expect("workspace should be discovered");
+
+        let report = check_workspace(&workspace, &workspace.dependency_versions);
+
+        assert!(report.is_success());
+        assert!(report.version_mismatches.is_empty());
+    }
+
+    #[test]
+    fn reports_mismatched_git_commits_and_repositories() {
+        let test_workspace = TestWorkspace::new("gomo-dependency-versions-git-test");
+        test_workspace.write_gomo_config();
+        let resolutions = [
+            ("one", "https://github.com/lustre-labs/lustre", "abc123"),
+            ("two", "https://github.com/lustre-labs/lustre", "def456"),
+            ("three", "https://github.com/example/lustre", "abc123"),
+        ];
+        for (project, repo, commit) in resolutions {
+            test_workspace.write_manifest(
+                &format!("apps/{project}"),
+                &format!("name = \"{project}\"\nversion = \"0.1.0\"\n"),
+            );
+            test_workspace.write_file(
+                &format!("apps/{project}/manifest.toml"),
+                &format!(
+                    "packages = [\n  {{ name = \"lustre\", version = \"5.7.0\", source = \"git\", repo = \"{repo}\", commit = \"{commit}\" }},\n]\n"
+                ),
+            );
+        }
+        let workspace = crate::workspace::discover(test_workspace.path())
+            .expect("workspace should be discovered");
+
+        let report = check_workspace(&workspace, &workspace.dependency_versions);
+
+        assert_eq!(report.version_mismatches.len(), 1);
+        let mismatch = &report.version_mismatches[0];
+        assert_eq!(mismatch.dependency, "lustre");
+        assert_eq!(mismatch.source, "git");
+        assert_eq!(mismatch.versions.len(), 3);
+        assert!(mismatch.versions.iter().any(|resolution| {
+            resolution.repo.as_deref() == Some("https://github.com/lustre-labs/lustre")
+                && resolution.commit.as_deref() == Some("def456")
+        }));
+        assert!(mismatch.versions.iter().any(|resolution| {
+            resolution.repo.as_deref() == Some("https://github.com/example/lustre")
+                && resolution.commit.as_deref() == Some("abc123")
+        }));
     }
 
     #[test]

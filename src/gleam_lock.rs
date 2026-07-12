@@ -18,6 +18,8 @@ pub(crate) struct LockedPackage {
     pub(crate) version: String,
     pub(crate) source: LockedPackageSource,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) repo: Option<String>,
+    pub(crate) commit: Option<String>,
 }
 
 /// Resolved package source from a Gleam `manifest.toml` package entry.
@@ -40,6 +42,8 @@ struct RawLockedPackage {
     version: String,
     source: String,
     path: Option<PathBuf>,
+    repo: Option<String>,
+    commit: Option<String>,
 }
 
 impl LockedPackageSource {
@@ -101,6 +105,8 @@ pub(crate) fn parse_lock_manifest(path: &Path) -> Result<GleamLockManifest> {
             version,
             source: LockedPackageSource::parse(source),
             path: package.path,
+            repo: normalize_optional(package.repo),
+            commit: normalize_optional(package.commit),
         });
     }
 
@@ -110,9 +116,17 @@ pub(crate) fn parse_lock_manifest(path: &Path) -> Result<GleamLockManifest> {
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.version.cmp(&right.version))
             .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.repo.cmp(&right.repo))
+            .then_with(|| left.commit.cmp(&right.commit))
     });
 
     Ok(GleamLockManifest { packages })
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -130,6 +144,7 @@ mod tests {
 packages = [
   { name = "gleam_stdlib", version = "1.0.2", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "abc" },
   { name = "shared", version = "0.1.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], source = "local", path = "../shared" },
+  { name = "lustre", version = "5.7.0", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/lustre-labs/lustre", commit = "abc123" },
 ]
 
 [requirements]
@@ -139,7 +154,7 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
 
         let manifest = parse_lock_manifest(&path).expect("lock manifest should parse");
 
-        assert_eq!(manifest.packages.len(), 2);
+        assert_eq!(manifest.packages.len(), 3);
         assert_eq!(manifest.packages[0].name, "gleam_stdlib");
         assert_eq!(manifest.packages[0].version, "1.0.2");
         assert_eq!(manifest.packages[0].source, LockedPackageSource::Hex);
@@ -147,5 +162,12 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
         assert_eq!(manifest.packages[1].version, "0.1.0");
         assert_eq!(manifest.packages[1].source, LockedPackageSource::Local);
         assert_eq!(manifest.packages[1].path, Some(PathBuf::from("../shared")));
+        assert_eq!(manifest.packages[2].name, "lustre");
+        assert_eq!(manifest.packages[2].source.as_str(), "git");
+        assert_eq!(
+            manifest.packages[2].repo.as_deref(),
+            Some("https://github.com/lustre-labs/lustre")
+        );
+        assert_eq!(manifest.packages[2].commit.as_deref(), Some("abc123"));
     }
 }

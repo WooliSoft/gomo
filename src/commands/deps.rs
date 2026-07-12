@@ -44,7 +44,7 @@ fn render_plain(report: &DependencyVersionReport) -> String {
     output.push_str(&format!("Manifests: {}\n", report.checked_manifest_count));
 
     if report.is_success() {
-        output.push_str("[ok] all checked dependencies resolve to one version\n");
+        output.push_str("[ok] all checked dependencies have consistent resolutions\n");
         return output;
     }
 
@@ -67,7 +67,7 @@ fn render_plain(report: &DependencyVersionReport) -> String {
 
     for mismatch in &report.version_mismatches {
         output.push_str(&format!(
-            "[error] {} ({}) has multiple resolved versions:\n",
+            "[error] {} ({}) has multiple resolutions:\n",
             mismatch.dependency, mismatch.source
         ));
         for version in &mismatch.versions {
@@ -77,7 +77,11 @@ fn render_plain(report: &DependencyVersionReport) -> String {
                 .map(|occurrence| occurrence.project.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            output.push_str(&format!("  {}: {}\n", version.version, projects));
+            output.push_str(&format!(
+                "  {}: {}\n",
+                resolution_display(version),
+                projects
+            ));
         }
     }
 
@@ -144,7 +148,7 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
     if report.is_success() {
         push_bordered_line(
             &mut output,
-            "[ok] all checked dependencies resolve to one version",
+            "[ok] all checked dependencies have consistent resolutions",
             width,
             Some(BOLD_GREEN),
         );
@@ -193,7 +197,7 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
         push_bordered_line(
             &mut output,
             &format!(
-                "[error] {} ({}) has multiple resolved versions:",
+                "[error] {} ({}) has multiple resolutions:",
                 mismatch.dependency, mismatch.source
             ),
             width,
@@ -208,7 +212,7 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
                 .join(", ");
             push_bordered_line(
                 &mut output,
-                &format!("  {}: {}", version.version, projects),
+                &format!("  {}: {}", resolution_display(version), projects),
                 width,
                 Some(BOLD_YELLOW),
             );
@@ -249,6 +253,17 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
 
     push_border_line(&mut output, '╰', '─', '╯', width);
     output
+}
+
+fn resolution_display(version: &crate::dependency_versions::VersionGroup) -> String {
+    let mut display = version.version.clone();
+    if let Some(repo) = &version.repo {
+        display.push_str(&format!(" repo={repo}"));
+    }
+    if let Some(commit) = &version.commit {
+        display.push_str(&format!(" commit={commit}"));
+    }
+    display
 }
 
 fn content_width(width: usize) -> usize {
@@ -354,7 +369,7 @@ packages = [
         assert!(output.stdout.contains("\x1b[1;32m"));
         assert!(visible.contains("╭"));
         assert!(visible.contains("Status: ok"));
-        assert!(visible.contains("[ok] all checked dependencies resolve to one version"));
+        assert!(visible.contains("[ok] all checked dependencies have consistent resolutions"));
         assert_lines_fit(&output.stdout, DEFAULT_RICH_WIDTH);
     }
 

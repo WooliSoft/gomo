@@ -116,23 +116,10 @@ fn parse_custom_command(
         );
     }
 
-    let parts = shell_words::split(command).with_context(|| {
-        format!(
-            "failed to parse custom command for `{target}` in {}",
-            project.manifest_path.display()
-        )
-    })?;
-    let Some((program, args)) = parts.split_first() else {
-        bail!(
-            "custom command for `{target}` in {} must include a program",
-            project.manifest_path.display()
-        );
-    };
-
     Ok(ResolvedCommand {
         display: command.to_string(),
-        program: program.clone(),
-        args: args.to_vec(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), command.to_string()],
     })
 }
 
@@ -417,11 +404,11 @@ command = "gleam test --target erlang"
             .expect("custom test command should resolve");
 
         assert_eq!(build.display, "mise exec -- gleam build");
-        assert_eq!(build.program, "mise");
-        assert_eq!(build.args, ["exec", "--", "gleam", "build"]);
+        assert_eq!(build.program, "sh");
+        assert_eq!(build.args, ["-c", "mise exec -- gleam build"]);
         assert_eq!(test.display, "gleam test --target erlang");
-        assert_eq!(test.program, "gleam");
-        assert_eq!(test.args, ["test", "--target", "erlang"]);
+        assert_eq!(test.program, "sh");
+        assert_eq!(test.args, ["-c", "gleam test --target erlang"]);
     }
 
     #[test]
@@ -449,11 +436,11 @@ command = "mise exec -- gleam format --check"
         .expect("custom format check command should resolve");
 
         assert_eq!(format.display, "mise exec -- gleam format");
-        assert_eq!(format.program, "mise");
-        assert_eq!(format.args, ["exec", "--", "gleam", "format"]);
+        assert_eq!(format.program, "sh");
+        assert_eq!(format.args, ["-c", "mise exec -- gleam format"]);
         assert_eq!(check.display, "mise exec -- gleam format --check");
-        assert_eq!(check.program, "mise");
-        assert_eq!(check.args, ["exec", "--", "gleam", "format", "--check"]);
+        assert_eq!(check.program, "sh");
+        assert_eq!(check.args, ["-c", "mise exec -- gleam format --check"]);
     }
 
     #[test]
@@ -478,5 +465,42 @@ inputs = ["gleam.toml", "src/**"]
         assert_eq!(check.display, "gleam format --check");
         assert_eq!(check.program, "gleam");
         assert_eq!(check.args, ["format", "--check"]);
+    }
+
+    #[test]
+    fn custom_commands_support_shell_operators() {
+        let test_workspace = TestWorkspace::new("gomo-runner-shell-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["libs/*"]
+"#,
+        );
+        test_workspace.write_manifest(
+            "libs/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+command = "printf first > result.txt && printf second >> result.txt"
+"#,
+        );
+        let project = workspace::discover(test_workspace.path())
+            .expect("workspace should load")
+            .projects
+            .into_iter()
+            .next()
+            .expect("project should exist");
+
+        let execution = GleamCommandRunner.run(&project, Target::Build, CommandOptions::default());
+
+        assert_eq!(execution.exit_code, 0, "{}", execution.stderr);
+        assert_eq!(
+            std::fs::read_to_string(project.root.join("result.txt"))
+                .expect("custom command should write its output"),
+            "firstsecond"
+        );
     }
 }
