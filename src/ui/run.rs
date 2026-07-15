@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -160,7 +159,7 @@ impl RunManyTerminal {
     pub(crate) fn finish(&mut self, summary: &TaskSummary) -> io::Result<RunManyExit> {
         self.summary = Some(summary.clone());
         self.draw()?;
-        if is_agent_environment() {
+        if super::is_agent_environment() {
             self.restore()?;
             return Ok(RunManyExit::AutoExited);
         }
@@ -335,12 +334,6 @@ enum TaskRowStatus {
     Cached,
     Failed(i32),
     Skipped,
-}
-
-fn is_agent_environment() -> bool {
-    env::var("AGENT").is_ok_and(|v| v == "1")
-        || env::var("OPENCODE").is_ok_and(|v| v == "1")
-        || env::var("CODEX_CI").is_ok_and(|v| v == "1")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

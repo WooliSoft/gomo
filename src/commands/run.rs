@@ -627,7 +627,12 @@ where
             output.push_str(&ui::run::render_terminal_summary(&summary));
         }
     } else if !tui_enabled {
-        append_task_outputs(&mut output, project_names, &mut task_outputs);
+        append_task_outputs(
+            &mut output,
+            project_names,
+            &mut task_outputs,
+            output_options.ci,
+        );
         output.push_str(&render_summary(&summary));
     }
 
@@ -1017,7 +1022,7 @@ fn render_auto_exit_logs(
         "Gomo auto-exited after completing target `{}`. Captured task logs follow.\nTarget: {}\nTotal Tasks: {}\n\n--- BEGIN GOMO TASK LOGS ---\n",
         summary.target, summary.target, summary.total,
     );
-    append_task_outputs(&mut output, project_names, task_outputs);
+    append_task_outputs(&mut output, project_names, task_outputs, false);
     if !output.ends_with('\n') {
         output.push('\n');
     }
@@ -1029,12 +1034,51 @@ fn append_task_outputs(
     output: &mut String,
     project_names: &[String],
     task_outputs: &mut BTreeMap<String, String>,
+    plain: bool,
 ) {
     for project_name in project_names {
         if let Some(task_output) = task_outputs.remove(project_name) {
-            output.push_str(&task_output);
+            if plain {
+                output.push_str(&strip_terminal_sequences(&task_output));
+            } else {
+                output.push_str(&task_output);
+            }
         }
     }
+}
+
+fn strip_terminal_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(character) = chars.next() {
+        if character != '\x1b' {
+            output.push(character);
+            continue;
+        }
+
+        match chars.next() {
+            Some('[') => {
+                for character in chars.by_ref() {
+                    if ('@'..='~').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut escape = false;
+                for character in chars.by_ref() {
+                    if character == '\x07' || (escape && character == '\\') {
+                        break;
+                    }
+                    escape = character == '\x1b';
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    output
 }
 
 fn render_json_summary(summary: &TaskSummary) -> Result<String> {
@@ -1511,6 +1555,21 @@ version = "0.1.0"
         assert!(output.contains("==> protocol:build (libs/protocol)"));
         assert!(output.contains("compiled"));
         assert!(output.contains("--- END GOMO TASK LOGS ---"));
+        assert!(task_outputs.is_empty());
+    }
+
+    #[test]
+    fn plain_task_output_strips_terminal_sequences() {
+        let project_names = vec!["protocol".to_string()];
+        let mut task_outputs = BTreeMap::from([(
+            "protocol".to_string(),
+            "\x1b[32mcompiled\x1b[39m\n\x1b]0;task title\x07done\n".to_string(),
+        )]);
+        let mut output = String::new();
+
+        append_task_outputs(&mut output, &project_names, &mut task_outputs, true);
+
+        assert_eq!(output, "compiled\ndone\n");
         assert!(task_outputs.is_empty());
     }
 

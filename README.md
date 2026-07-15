@@ -31,8 +31,10 @@ is an interactive terminal. It shows per-project status, selected task logs,
 current parallel work, progress, and cache counts. Use `↑`/`↓` or `j`/`k` to
 select tasks and `L` to view logs fullscreen without side borders for easier
 copying. If the finished TUI auto-exits, Gomo prints the captured task logs and
-summary in a static format. Use `--ci` for static logs or `--json` for
-machine-readable summaries.
+summary in a static format. Gomo automatically uses plain static output when
+run by a recognized coding agent, terminal I/O is captured, `TERM=dumb`,
+`NO_COLOR` is set, or `CI` is set. Use `--ci` to force static logs or `--json`
+for machine-readable summaries.
 
 Run one project, or include its upstream local dependencies:
 
@@ -155,8 +157,9 @@ is intentionally deferred until the repo has a real retention policy.
 
 ## CI Workflows
 
-Use `--ci` to avoid rich terminal rendering and `--json` for machine-readable
-summaries:
+Non-interactive commands automatically avoid rich terminal rendering. Use
+`--ci` to force plain output even in a terminal and `--json` for
+machine-readable summaries:
 
 ```sh
 gomo --ci doctor

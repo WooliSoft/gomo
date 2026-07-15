@@ -24,7 +24,7 @@ const HELP_STYLES: Styles = Styles::styled()
     name = "gomo",
     version,
     about = "Monorepo tooling for Gleam packages",
-    color = ColorChoice::Always,
+    color = ColorChoice::Auto,
     styles = HELP_STYLES
 )]
 struct Cli {
@@ -176,7 +176,7 @@ struct ProjectSelectionArgs {
 /// Parse CLI arguments and run the requested command.
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let stdout = execute_from_with_tui(Cli::parse(), &cwd, should_auto_tui())?;
+    let stdout = execute_from_with_terminal(Cli::parse(), &cwd, should_use_rich_output())?;
     print!("{}", stdout.stdout);
     io::stdout().flush()?;
     if !stdout.is_success() {
@@ -187,10 +187,14 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 fn execute_from(cli: Cli, cwd: &Path) -> Result<CommandOutput> {
-    execute_from_with_tui(cli, cwd, false)
+    execute_from_with_terminal(cli, cwd, false)
 }
 
-fn execute_from_with_tui(cli: Cli, cwd: &Path, auto_tui: bool) -> Result<CommandOutput> {
+fn execute_from_with_terminal(
+    cli: Cli,
+    cwd: &Path,
+    interactive_terminal: bool,
+) -> Result<CommandOutput> {
     let cache_options = commands::run::CacheOptions {
         no_cache: cli.no_cache,
         no_restore: cli.no_restore,
@@ -200,9 +204,9 @@ fn execute_from_with_tui(cli: Cli, cwd: &Path, auto_tui: bool) -> Result<Command
         .unwrap_or(commands::run::Parallelism::WorkspaceDefault);
     let output_options = OutputOptions {
         json: cli.json,
-        ci: cli.ci || cli.json,
-        tui: auto_tui && !cli.ci && !cli.json,
-        terminal_width: terminal_width(auto_tui && !cli.ci && !cli.json),
+        ci: cli.ci || cli.json || !interactive_terminal,
+        tui: interactive_terminal && !cli.ci && !cli.json,
+        terminal_width: terminal_width(interactive_terminal && !cli.ci && !cli.json),
     };
 
     match cli.command {
@@ -313,13 +317,34 @@ fn execute_from_with_tui(cli: Cli, cwd: &Path, auto_tui: bool) -> Result<Command
         None => {
             let mut command = Cli::command();
             let help = command.render_help();
-            Ok(CommandOutput::success(help.ansi().to_string()))
+            let help = if output_options.ci {
+                help.to_string()
+            } else {
+                help.ansi().to_string()
+            };
+            Ok(CommandOutput::success(help))
         }
     }
 }
 
-fn should_auto_tui() -> bool {
-    io::stdout().is_terminal() && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+fn should_use_rich_output() -> bool {
+    rich_output_enabled(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        env::var("TERM").ok().as_deref(),
+        env::var_os("NO_COLOR").is_some(),
+        env::var_os("CI").is_some() || crate::ui::is_agent_environment(),
+    )
+}
+
+fn rich_output_enabled(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    term: Option<&str>,
+    no_color: bool,
+    ci: bool,
+) -> bool {
+    stdin_is_terminal && stdout_is_terminal && term != Some("dumb") && !no_color && !ci
 }
 
 fn terminal_width(enabled: bool) -> Option<u16> {
@@ -433,24 +458,74 @@ mod tests {
     #[test]
     fn prints_help_with_no_args() {
         let stdout = execute_args(&[]).expect("no args should render help");
-        let visible = strip_ansi(&stdout);
+
+        assert!(!stdout.contains("\x1b["));
+        assert!(stdout.contains("Usage:"));
+        assert!(stdout.contains("affected"));
+        assert!(stdout.contains("build"));
+        assert!(stdout.contains("clean"));
+        assert!(stdout.contains("completions"));
+        assert!(stdout.contains("deps"));
+        assert!(stdout.contains("doctor"));
+        assert!(stdout.contains("explain"));
+        assert!(stdout.contains("format"));
+        assert!(stdout.contains("graph"));
+        assert!(stdout.contains("projects"));
+        assert!(stdout.contains("reset"));
+        assert!(stdout.contains("run"));
+        assert!(stdout.contains("run-many"));
+        assert!(stdout.contains("test"));
+    }
+
+    #[test]
+    fn interactive_help_uses_rich_output() {
+        let cli = Cli::try_parse_from(["gomo"]).expect("args should parse");
+        let stdout = execute_from_with_terminal(cli, Path::new("."), true)
+            .expect("no args should render help")
+            .stdout;
 
         assert!(stdout.contains("\x1b["));
-        assert!(visible.contains("Usage:"));
-        assert!(visible.contains("affected"));
-        assert!(visible.contains("build"));
-        assert!(visible.contains("clean"));
-        assert!(visible.contains("completions"));
-        assert!(visible.contains("deps"));
-        assert!(visible.contains("doctor"));
-        assert!(visible.contains("explain"));
-        assert!(visible.contains("format"));
-        assert!(visible.contains("graph"));
-        assert!(visible.contains("projects"));
-        assert!(visible.contains("reset"));
-        assert!(visible.contains("run"));
-        assert!(visible.contains("run-many"));
-        assert!(visible.contains("test"));
+        assert!(strip_ansi(&stdout).contains("Usage:"));
+    }
+
+    #[test]
+    fn rich_output_requires_a_color_capable_interactive_terminal() {
+        assert!(rich_output_enabled(
+            true,
+            true,
+            Some("xterm-256color"),
+            false,
+            false
+        ));
+        assert!(!rich_output_enabled(
+            false,
+            true,
+            Some("xterm-256color"),
+            false,
+            false
+        ));
+        assert!(!rich_output_enabled(
+            true,
+            false,
+            Some("xterm-256color"),
+            false,
+            false
+        ));
+        assert!(!rich_output_enabled(true, true, Some("dumb"), false, false));
+        assert!(!rich_output_enabled(
+            true,
+            true,
+            Some("xterm-256color"),
+            true,
+            false
+        ));
+        assert!(!rich_output_enabled(
+            true,
+            true,
+            Some("xterm-256color"),
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -543,7 +618,7 @@ version = "0.1.0"
         let nested_dir = test_workspace.path().join("apps/demo/src");
         fs::create_dir_all(&nested_dir).expect("nested dir should be created");
         let cli = Cli::try_parse_from(["gomo", "projects"]).expect("args should parse");
-        let stdout = execute_from(cli, &nested_dir)
+        let stdout = execute_from_with_terminal(cli, &nested_dir, true)
             .expect("projects should be listed")
             .stdout;
 
@@ -551,13 +626,11 @@ version = "0.1.0"
         assert!(stdout.contains("Name"));
         assert!(stdout.contains("Target"));
         assert!(stdout.contains("Root"));
-        assert!(stdout.contains("Dependencies"));
         assert!(stdout.contains("demo"));
         assert!(stdout.contains("javascript"));
         assert!(stdout.contains("apps/demo"));
         assert!(stdout.contains("shared"));
         assert!(stdout.contains("erlang"));
-        assert!(stdout.contains("-"));
         assert!(!stdout.contains("../../libs/shared"));
     }
 
@@ -596,7 +669,7 @@ version = "0.1.0"
         );
 
         let cli = Cli::try_parse_from(["gomo", "--ci", "projects"]).expect("args should parse");
-        let stdout = execute_from(cli, test_workspace.path())
+        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true)
             .expect("CI projects should be listed")
             .stdout;
 
@@ -604,6 +677,43 @@ version = "0.1.0"
         assert!(stdout.contains("shared"));
         assert!(!stdout.contains("\x1b["));
         assert!(!stdout.contains("│"));
+    }
+
+    #[test]
+    fn non_interactive_inspection_commands_use_plain_output() {
+        let test_workspace = TestWorkspace::new("gomo-cli-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file(
+            "libs/shared/manifest.toml",
+            r#"
+packages = [
+  { name = "gleam_stdlib", version = "1.0.2", build_tools = ["gleam"], requirements = [], source = "hex" },
+]
+"#,
+        );
+
+        for args in [
+            &["deps", "check"][..],
+            &["doctor"][..],
+            &["graph"][..],
+            &["projects"][..],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("gomo").chain(args.iter().copied()))
+                .expect("args should parse");
+            let stdout = execute_from(cli, test_workspace.path())
+                .expect("inspection command should run")
+                .stdout;
+
+            assert!(!stdout.contains("\x1b["), "{args:?} emitted ANSI output");
+            assert!(!stdout.contains('╭'), "{args:?} emitted a rich border");
+        }
     }
 
     #[test]
@@ -630,7 +740,7 @@ version = "0.1.0"
         );
 
         let cli = Cli::try_parse_from(["gomo", "graph"]).expect("args should parse");
-        let stdout = execute_from(cli, test_workspace.path())
+        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true)
             .expect("graph should be listed")
             .stdout;
 

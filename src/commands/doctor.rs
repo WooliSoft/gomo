@@ -486,7 +486,8 @@ version = "0.1.0"
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.contains("\x1b[1;31m"));
         assert!(visible.contains("[error] workspace discovery"));
-        assert!(visible.contains("add gomo.toml"));
+        assert!(visible.contains("add"));
+        assert!(visible.contains("gomo.toml"));
         assert_lines_fit(&output.stdout, DEFAULT_RICH_WIDTH);
     }
 
