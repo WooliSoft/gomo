@@ -182,7 +182,13 @@ struct ProjectSelectionArgs {
 /// Parse CLI arguments and run the requested command.
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let stdout = execute_from_with_terminal(Cli::parse(), &cwd, should_use_rich_output())?;
+    let interactive_terminal = should_use_rich_output();
+    let stdout = execute_from_with_terminal(
+        Cli::parse(),
+        &cwd,
+        interactive_terminal,
+        terminal_width(interactive_terminal),
+    )?;
     print!("{}", stdout.stdout);
     io::stdout().flush()?;
     if !stdout.is_success() {
@@ -193,13 +199,14 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 fn execute_from(cli: Cli, cwd: &Path) -> Result<CommandOutput> {
-    execute_from_with_terminal(cli, cwd, false)
+    execute_from_with_terminal(cli, cwd, false, None)
 }
 
 fn execute_from_with_terminal(
     cli: Cli,
     cwd: &Path,
     interactive_terminal: bool,
+    terminal_width: Option<u16>,
 ) -> Result<CommandOutput> {
     let cache_options = commands::run::CacheOptions {
         no_cache: cli.no_cache,
@@ -212,7 +219,11 @@ fn execute_from_with_terminal(
         json: cli.json,
         ci: cli.ci || cli.json || !interactive_terminal,
         tui: interactive_terminal && !cli.ci && !cli.json,
-        terminal_width: terminal_width(interactive_terminal && !cli.ci && !cli.json),
+        terminal_width: if interactive_terminal && !cli.ci && !cli.json {
+            terminal_width
+        } else {
+            None
+        },
     };
 
     match cli.command {
@@ -364,6 +375,7 @@ fn terminal_width(enabled: bool) -> Option<u16> {
     crossterm::terminal::size()
         .ok()
         .map(|(width, _height)| width)
+        .filter(|width| *width > 0)
 }
 
 fn run_shorthand(
@@ -490,7 +502,7 @@ mod tests {
     #[test]
     fn interactive_help_uses_rich_output() {
         let cli = Cli::try_parse_from(["gomo"]).expect("args should parse");
-        let stdout = execute_from_with_terminal(cli, Path::new("."), true)
+        let stdout = execute_from_with_terminal(cli, Path::new("."), true, Some(120))
             .expect("no args should render help")
             .stdout;
 
@@ -629,7 +641,7 @@ version = "0.1.0"
         let nested_dir = test_workspace.path().join("apps/demo/src");
         fs::create_dir_all(&nested_dir).expect("nested dir should be created");
         let cli = Cli::try_parse_from(["gomo", "projects"]).expect("args should parse");
-        let stdout = execute_from_with_terminal(cli, &nested_dir, true)
+        let stdout = execute_from_with_terminal(cli, &nested_dir, true, Some(120))
             .expect("projects should be listed")
             .stdout;
 
@@ -680,7 +692,7 @@ version = "0.1.0"
         );
 
         let cli = Cli::try_parse_from(["gomo", "--ci", "projects"]).expect("args should parse");
-        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true)
+        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true, Some(120))
             .expect("CI projects should be listed")
             .stdout;
 
@@ -751,7 +763,7 @@ version = "0.1.0"
         );
 
         let cli = Cli::try_parse_from(["gomo", "graph"]).expect("args should parse");
-        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true)
+        let stdout = execute_from_with_terminal(cli, test_workspace.path(), true, Some(120))
             .expect("graph should be listed")
             .stdout;
 
