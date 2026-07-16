@@ -1,0 +1,6 @@
+.gomo/
+**/.lustre/
+**/build/
+**/dist/
+services/api/priv/static/
+erl_crash.dump

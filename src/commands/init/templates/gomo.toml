@@ -1,0 +1,6 @@
+[workspace]
+project_roots = ["apps/*", "libs/*", "services/*"]
+default_parallelism = "auto"
+
+[cache]
+dir = ".gomo/cache"

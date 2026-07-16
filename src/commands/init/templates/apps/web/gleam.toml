@@ -1,0 +1,29 @@
+name = "web"
+version = "0.1.0"
+gleam = ">= 1.17.0"
+target = "javascript"
+
+[javascript]
+runtime = "nodejs"
+
+[dependencies]
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+lustre = ">= 5.7.1 and < 6.0.0"
+rsvp = ">= 2.0.0 and < 3.0.0"
+shared = { path = "../../libs/shared" }
+
+[dev-dependencies]
+gleeunit = ">= 1.11.0 and < 2.0.0"
+lustre_dev_tools = ">= 2.3.6 and < 3.0.0"
+
+[tools.lustre.dev]
+proxy = { from = "/api", to = "http://localhost:3000/api" }
+watch = ["../../libs/shared/src"]
+
+[tools.lustre.build]
+minify = true
+outdir = "../../services/api/priv/static"
+
+[tools.lustre.html]
+title = "Gomo Starter"
+stylesheets = [{ href = "/styles.css" }]

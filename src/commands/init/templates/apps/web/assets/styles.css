@@ -1,0 +1,127 @@
+:root {
+  color: #1b2430;
+  background: #f2efe8;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.7rem 1rem;
+  color: white;
+  background: #c84b31;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background:
+    radial-gradient(circle at 15% 15%, #ffcf70 0, transparent 28rem),
+    linear-gradient(135deg, #f8f5ee, #dce9e6);
+}
+
+.card {
+  width: min(100%, 48rem);
+  padding: clamp(2rem, 7vw, 5rem);
+  border: 1px solid rgb(27 36 48 / 14%);
+  border-radius: 2rem;
+  background: rgb(255 255 255 / 78%);
+  box-shadow: 0 2rem 6rem rgb(27 36 48 / 14%);
+  backdrop-filter: blur(1rem);
+}
+
+.eyebrow {
+  margin: 0 0 1rem;
+  color: #c84b31;
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+}
+
+h1 {
+  max-width: 12ch;
+  margin: 0;
+  font-family: Georgia, serif;
+  font-size: clamp(2.5rem, 8vw, 5.5rem);
+  font-weight: 500;
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+}
+
+.intro {
+  max-width: 37rem;
+  margin: 2rem 0;
+  color: #56616d;
+  font-size: 1.1rem;
+  line-height: 1.65;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: fit-content;
+  padding: 0.8rem 1rem;
+  border-radius: 999px;
+  background: #edf2f0;
+  font-weight: 700;
+}
+
+.dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: #85919b;
+}
+
+.connected .dot {
+  background: #228b5a;
+  box-shadow: 0 0 0 0.3rem rgb(34 139 90 / 14%);
+}
+
+.loading .dot {
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+
+.error {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  color: #8e2f22;
+}
+
+@keyframes pulse {
+  to {
+    opacity: 0.35;
+  }
+}
+
+@media (max-width: 40rem) {
+  .shell {
+    padding: 1rem;
+  }
+
+  .card {
+    border-radius: 1.25rem;
+  }
+
+  .error {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

@@ -6,6 +6,29 @@ discovers packages from configured project roots such as
 from Gleam path dependencies, runs tasks in dependency order, and caches
 successful build and test tasks.
 
+## Create a Workspace
+
+Create a full-stack Gleam monorepo in a new directory, or initialize the current
+directory:
+
+```sh
+gomo init my_app
+gomo init .
+```
+
+The generated starter contains a JavaScript Lustre frontend under `apps/web`, a
+shared API contract package under `libs/shared`, and a Wisp/Mist service under
+`services/api`. The frontend uses the official `lustre_dev_tools` development
+server and proxies `/api` requests to the service. The scaffold also includes an
+Ubuntu GitHub Actions workflow, focused tests, and a README with development and
+production commands. Package lock manifests are included so CI can run
+`gomo deps check`. The scaffold does not generate Nix files, a task runner, or
+version control metadata.
+
+`init` refuses to overwrite managed files or merge into existing generated
+package directories. Other files already present in the target directory are
+left unchanged.
+
 ## Local Workflows
 
 From anywhere inside a configured workspace:

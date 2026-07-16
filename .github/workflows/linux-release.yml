@@ -1,0 +1,44 @@
+name: Linux Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build and release Linux x86_64 binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+
+          archive="gomo-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          strip target/x86_64-unknown-linux-gnu/release/gomo
+          mkdir -p dist
+          tar -C target/x86_64-unknown-linux-gnu/release -czf "dist/$archive" gomo
+          checksum="$(sha256sum "dist/$archive")"
+          printf '%s  %s\n' "${checksum%% *}" "$archive" > "dist/$archive.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          gleam-version: "1.17.0"
+          rebar3-version: "3"
+
+      - name: Install Gomo
+        run: |
+          set -euo pipefail
+
+          archive="gomo-v{{GOMO_VERSION}}-x86_64-unknown-linux-gnu.tar.gz"
+          release_url="https://github.com/WooliSoft/gomo/releases/download/v{{GOMO_VERSION}}"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$archive" "$release_url/$archive"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$archive.sha256" "$release_url/$archive.sha256"
+
+          checksum="$(< "$RUNNER_TEMP/$archive.sha256")"
+          printf '%s  %s\n' "${checksum%% *}" "$RUNNER_TEMP/$archive" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/gomo" /usr/local/bin/gomo
+
+      - name: Check formatting
+        run: gomo format --check
+
+      - name: Build workspace
+        run: gomo --ci build
+
+      - name: Check dependency versions
+        run: gomo --ci deps check
+
+      - name: Test workspace
+        run: gomo --ci test
+
+      - name: Build frontend bundle
+        working-directory: apps/web
+        run: gleam run -m lustre/dev build

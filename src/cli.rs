@@ -102,6 +102,12 @@ enum Commands {
     },
     /// Inspect the workspace dependency graph.
     Graph,
+    /// Create a full-stack Lustre monorepo.
+    Init {
+        /// Directory to initialize.
+        #[arg(default_value = ".", value_name = "PATH")]
+        path: PathBuf,
+    },
     /// List workspace projects.
     Projects,
     /// Reset local Gomo state intentionally.
@@ -273,6 +279,9 @@ fn execute_from_with_terminal(
             output_options,
         ),
         Some(Commands::Graph) => commands::graph::run(cwd, output_options),
+        Some(Commands::Init { path }) => {
+            commands::init::run(cwd, commands::init::InitRequest { path }, output_options)
+        }
         Some(Commands::Projects) => commands::projects::run(cwd, output_options),
         Some(Commands::Reset { only_cache }) => commands::reset::run(
             cwd,
@@ -470,6 +479,7 @@ mod tests {
         assert!(stdout.contains("explain"));
         assert!(stdout.contains("format"));
         assert!(stdout.contains("graph"));
+        assert!(stdout.contains("init"));
         assert!(stdout.contains("projects"));
         assert!(stdout.contains("reset"));
         assert!(stdout.contains("run"));
@@ -543,6 +553,7 @@ mod tests {
         assert!(stdout.contains("explain"));
         assert!(stdout.contains("format"));
         assert!(stdout.contains("graph"));
+        assert!(stdout.contains("init"));
         assert!(stdout.contains("projects"));
         assert!(stdout.contains("reset"));
         assert!(stdout.contains("run"));
@@ -890,6 +901,37 @@ version = "0.1.0"
             Some(Commands::Reset { only_cache }) => assert!(only_cache),
             other => panic!("expected reset command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_init_path_and_defaults_to_current_directory() {
+        let cli = Cli::try_parse_from(["gomo", "init", "starter"]).expect("args should parse");
+        match cli.command {
+            Some(Commands::Init { path }) => assert_eq!(path, PathBuf::from("starter")),
+            other => panic!("expected init command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["gomo", "init"]).expect("args should parse");
+        match cli.command {
+            Some(Commands::Init { path }) => assert_eq!(path, PathBuf::from(".")),
+            other => panic!("expected init command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatches_init_command() {
+        let test_workspace = TestWorkspace::new("gomo-cli-init-test");
+        let cli = Cli::try_parse_from(["gomo", "init", "starter"]).expect("args should parse");
+
+        let output = execute_from(cli, test_workspace.path()).expect("init should run");
+
+        assert!(output.stdout.contains("Initialized Gomo workspace"));
+        assert!(
+            test_workspace
+                .path()
+                .join("starter/apps/web/gleam.toml")
+                .is_file()
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub(crate) mod deps;
 pub(crate) mod doctor;
 pub(crate) mod explain;
 pub(crate) mod graph;
+pub(crate) mod init;
 pub(crate) mod projects;
 pub(crate) mod reset;
 pub(crate) mod run;
