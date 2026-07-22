@@ -107,12 +107,17 @@ Unknown config fields are rejected so typos do not silently change behavior.
 Project-level target config lives in each package's `gleam.toml` under
 `[tools.gomo.<target>]`. `inputs` override the files used for cache keys and
 affected-file matching. `command` overrides the command Gomo runs for that
-target:
+target. Build targets can use `cached_folders` to replace the default
+`["build"]` output list with exact project-relative directories:
 
 ```toml
 [tools.gomo.test]
 inputs = ["gleam.toml", "src/**", "test/**", "fixtures/**"]
 command = "gleam test --target erlang"
+
+[tools.gomo.build]
+command = "sh ../../scripts/build_vite_app.sh ."
+cached_folders = ["build", "dist"]
 
 [tools.gomo.format]
 command = "mise exec -- gleam format"
@@ -163,8 +168,12 @@ leaving `doctor` unchanged.
 ## Cache
 
 Successful `build` and `test` tasks are cached by default. Build cache hits
-restore the project's `build/` directory; test cache hits replay the successful
-test output. Failed test runs are not cached.
+restore the project's configured cached folders, which default to `build/`;
+test cache hits replay the successful test output. Failed test runs are not
+cached. Every configured cached folder must be created by a successful build.
+Cache restore completely replaces each folder so stale output files cannot
+survive a cache hit. Cached folders must be non-overlapping, project-relative
+directories without `.` or `..`, and symlinks are not supported within them.
 
 Useful cache controls:
 

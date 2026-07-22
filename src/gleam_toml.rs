@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -30,6 +30,8 @@ pub struct GomoTargetConfig {
     pub command: Option<String>,
     /// Optional command override for check mode, currently used by format.
     pub check_command: Option<String>,
+    /// Optional build output directories to store and restore from cache.
+    pub cached_folders: Option<Vec<String>>,
 }
 
 /// A dependency declared with `{ path = "..." }`.
@@ -88,6 +90,7 @@ struct RawGomoTarget {
     inputs: Option<Vec<String>>,
     command: Option<String>,
     check: Option<RawGomoTargetCheck>,
+    cached_folders: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -179,6 +182,7 @@ fn collect_gomo_targets(
     insert_gomo_target(&mut targets, "format", tools.format);
     insert_gomo_target(&mut targets, "test", tools.test);
     validate_format_command_pair(path, &targets)?;
+    validate_cached_folders(path, &targets)?;
     Ok(targets)
 }
 
@@ -194,9 +198,68 @@ fn insert_gomo_target(
                 inputs: config.inputs,
                 command: config.command,
                 check_command: config.check.and_then(|check| check.command),
+                cached_folders: config.cached_folders,
             },
         );
     }
+}
+
+fn validate_cached_folders(
+    manifest_path: &Path,
+    targets: &BTreeMap<String, GomoTargetConfig>,
+) -> Result<()> {
+    for (target, config) in targets {
+        let Some(folders) = config.cached_folders.as_ref() else {
+            continue;
+        };
+        if target != "build" {
+            bail!(
+                "{} defines [tools.gomo.{target}].cached_folders, but cached folders are only supported for build tasks",
+                manifest_path.display()
+            );
+        }
+        if folders.is_empty() {
+            bail!(
+                "{} defines an empty [tools.gomo.build].cached_folders list",
+                manifest_path.display()
+            );
+        }
+
+        let mut paths = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let path = Path::new(folder);
+            if folder.trim().is_empty()
+                || path.is_absolute()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                bail!(
+                    "{} has invalid cached folder `{folder}`; paths must be non-empty project-relative directories without `.` or `..`",
+                    manifest_path.display()
+                );
+            }
+            if paths.iter().any(|existing: &PathBuf| existing == path) {
+                bail!(
+                    "{} defines duplicate cached folder `{folder}`",
+                    manifest_path.display()
+                );
+            }
+            if let Some(existing) = paths
+                .iter()
+                .find(|existing| existing.starts_with(path) || path.starts_with(existing))
+            {
+                bail!(
+                    "{} defines overlapping cached folders `{}` and `{folder}`",
+                    manifest_path.display(),
+                    existing.display()
+                );
+            }
+            paths.push(path.to_path_buf());
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_format_command_pair(
@@ -331,6 +394,75 @@ inputs = ["gleam.toml", "src/**", "fixtures/**"]
                 "fixtures/**".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn parses_build_cached_folders() {
+        let test_workspace = TestWorkspace::new("gomo-gleam-toml-test");
+        let path = test_workspace.write_file(
+            "gleam.toml",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+cached_folders = ["build", "dist"]
+"#,
+        );
+
+        let manifest = parse_manifest(&path).expect("manifest should parse");
+
+        assert_eq!(
+            manifest
+                .gomo_targets
+                .get("build")
+                .and_then(|config| config.cached_folders.as_ref()),
+            Some(&vec!["build".to_string(), "dist".to_string()])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_overlapping_cached_folders() {
+        for folders in [
+            "[]",
+            r#"["../dist"]"#,
+            r#"["dist", "dist"]"#,
+            r#"["build", "build/dev"]"#,
+        ] {
+            let test_workspace = TestWorkspace::new("gomo-gleam-toml-test");
+            let path = test_workspace.write_file(
+                "gleam.toml",
+                &format!(
+                    r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+cached_folders = {folders}
+"#
+                ),
+            );
+
+            parse_manifest(&path).expect_err("invalid cached folders should fail");
+        }
+    }
+
+    #[test]
+    fn rejects_cached_folders_for_non_build_targets() {
+        let test_workspace = TestWorkspace::new("gomo-gleam-toml-test");
+        let path = test_workspace.write_file(
+            "gleam.toml",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.test]
+cached_folders = ["coverage"]
+"#,
+        );
+
+        let error = parse_manifest(&path).expect_err("test cached folders should fail");
+        assert!(error.to_string().contains("only supported for build tasks"));
     }
 
     #[test]

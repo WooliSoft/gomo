@@ -85,6 +85,15 @@ fn render_explain(task_hash: &TaskHash) -> String {
         }
     }
 
+    output.push_str("Cached Folders:\n");
+    if task_hash.cached_folders.is_empty() {
+        output.push_str("- (none)\n");
+    } else {
+        for folder in &task_hash.cached_folders {
+            output.push_str(&format!("- {folder}\n"));
+        }
+    }
+
     output.push_str("Matched Inputs:\n");
     if task_hash.input_files.is_empty() {
         output.push_str("- (none)\n");
@@ -159,6 +168,7 @@ struct ExplainJson<'a> {
     manifest_hash: &'a str,
     input_globs: &'a [String],
     workspace_input_globs: &'a [String],
+    cached_folders: &'a [String],
     input_files: Vec<InputFileJson<'a>>,
     workspace_input_files: Vec<InputFileJson<'a>>,
     dependency_hashes: Vec<DependencyHashJson<'a>>,
@@ -201,6 +211,7 @@ impl<'a> From<&'a TaskHash> for ExplainJson<'a> {
             manifest_hash: &task_hash.manifest_hash,
             input_globs: &task_hash.input_globs,
             workspace_input_globs: &task_hash.workspace_input_globs,
+            cached_folders: &task_hash.cached_folders,
             input_files: task_hash
                 .input_files
                 .iter()
@@ -289,6 +300,7 @@ version = "0.1.0"
         assert!(output.contains("Command: gleam test"));
         assert!(output.contains("Input Globs:"));
         assert!(output.contains("- test/**"));
+        assert!(output.contains("Cached Folders:\n- (none)"));
         assert!(output.contains("Matched Inputs:"));
         assert!(output.contains("src/main.gleam"));
         assert!(output.contains("Dependency Task Hashes:"));
@@ -325,6 +337,7 @@ version = "0.1.0"
         assert_eq!(value["project"], "shared");
         assert_eq!(value["target"], "build");
         assert_eq!(value["input_source"], "built-in defaults");
+        assert_eq!(value["cached_folders"][0], "build");
     }
 
     #[test]

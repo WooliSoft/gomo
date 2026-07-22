@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v2";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = "v3";
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -62,6 +62,7 @@ pub(crate) struct TaskHash {
     pub(crate) input_source: InputGlobSource,
     pub(crate) input_globs: Vec<String>,
     pub(crate) workspace_input_globs: Vec<String>,
+    pub(crate) cached_folders: Vec<String>,
     pub(crate) manifest_hash: String,
     pub(crate) input_files: Vec<HashedInputFile>,
     pub(crate) workspace_input_files: Vec<HashedInputFile>,
@@ -168,6 +169,7 @@ fn compute_task_hash_inner(
         .with_context(|| format!("unknown project `{project_name}`"))?;
     let input_config = effective_input_globs(project, target)?;
     let workspace_input_globs = workspace_input_globs(workspace, target);
+    let cached_folders = effective_cached_folders(workspace, project, target)?;
     let input_files = expand_input_globs(project, &input_config.globs)?;
     let workspace_input_files = expand_workspace_input_globs(workspace, &workspace_input_globs)?;
     let manifest_hash = hash_file(&project.manifest_path)?.content_hash;
@@ -223,6 +225,9 @@ fn compute_task_hash_inner(
     }
     for input_glob in &workspace_input_globs {
         hash_field(&mut hasher, "workspace_input_glob", input_glob);
+    }
+    for cached_folder in &cached_folders {
+        hash_field(&mut hasher, "cached_folder", cached_folder);
     }
     for input_file in &input_files {
         hash_field(&mut hasher, "input_path", input_file.relative_path.as_str());
@@ -287,6 +292,7 @@ fn compute_task_hash_inner(
         input_source: input_config.source,
         input_globs: input_config.globs,
         workspace_input_globs,
+        cached_folders,
         manifest_hash,
         input_files,
         workspace_input_files,
@@ -335,6 +341,35 @@ fn uses_custom_build_command(project: &Project) -> bool {
 
 fn project_command(project: &Project, target: Target) -> Result<String> {
     CommandOptions::default().command_display(project, target)
+}
+
+fn effective_cached_folders(
+    workspace: &Workspace,
+    project: &Project,
+    target: Target,
+) -> Result<Vec<String>> {
+    if target != Target::Build {
+        return Ok(Vec::new());
+    }
+
+    let folders = project
+        .gomo_targets
+        .get(target.as_str())
+        .and_then(|config| config.cached_folders.clone())
+        .unwrap_or_else(|| vec!["build".to_string()]);
+    for folder in &folders {
+        let output_dir = project.root.join(folder);
+        if output_dir.starts_with(&workspace.cache_dir)
+            || workspace.cache_dir.starts_with(&output_dir)
+        {
+            bail!(
+                "cached folder {} overlaps Gomo cache directory {}",
+                output_dir.display(),
+                workspace.cache_dir.display()
+            );
+        }
+    }
+    Ok(folders)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -949,7 +984,8 @@ struct CacheEntryMetadata {
     input_globs: Vec<String>,
     stdout: CacheArtifactMetadata,
     stderr: CacheArtifactMetadata,
-    build_archive: Option<CacheArtifactMetadata>,
+    cached_folders: Vec<String>,
+    output_archive: Option<CacheArtifactMetadata>,
     created_at_unix_seconds: u64,
 }
 
@@ -971,8 +1007,8 @@ pub(crate) fn restore_successful_build(
         return Ok(None);
     }
 
-    let archive_path = entry_dir.join("build.tar.zst");
-    restore_build_archive(project, &archive_path)?;
+    let archive_path = entry_dir.join("outputs.tar.zst");
+    restore_build_outputs(project, task_hash, &archive_path)?;
 
     Ok(Some(CachedTaskExecution {
         stdout: read_optional_string(&entry_dir.join("stdout.txt"))?,
@@ -1024,13 +1060,16 @@ pub(crate) fn store_successful_build(
         bail!("failed build task `{}` must not be cached", project.name);
     }
 
-    let build_dir = project.root.join("build");
-    if !is_real_directory(&build_dir)? {
-        bail!(
-            "successful build task `{}` did not create {}",
-            project.name,
-            build_dir.display()
-        );
+    for folder in &task_hash.cached_folders {
+        let output_dir = project.root.join(folder);
+        ensure_cached_folder_parent_is_safe(project, folder)?;
+        if !is_real_directory(&output_dir)? {
+            bail!(
+                "successful build task `{}` did not create cached folder {}",
+                project.name,
+                output_dir.display()
+            );
+        }
     }
 
     let entry_dir = task_cache_entry_dir(workspace, task_hash);
@@ -1078,16 +1117,16 @@ pub(crate) fn store_successful_build(
             .with_context(|| format!("failed to write cached stdout for `{}`", project.name))?;
         let stderr = write_cache_text_artifact(&temp_dir.join("stderr.txt"), &execution.stderr)
             .with_context(|| format!("failed to write cached stderr for `{}`", project.name))?;
-        let archive_path = temp_dir.join("build.tar.zst");
-        write_build_archive(&archive_path, &build_dir)
-            .with_context(|| format!("failed to archive {}", build_dir.display()))?;
-        let build_archive = hash_cache_artifact(&archive_path)?;
+        let archive_path = temp_dir.join("outputs.tar.zst");
+        write_build_outputs_archive(&archive_path, project, &task_hash.cached_folders)
+            .with_context(|| format!("failed to archive build outputs for `{}`", project.name))?;
+        let output_archive = hash_cache_artifact(&archive_path)?;
         write_cache_metadata(
             &temp_dir.join("meta.json"),
             task_hash,
             stdout,
             stderr,
-            Some(build_archive),
+            Some(output_archive),
         )
         .with_context(|| format!("failed to write cache metadata for `{}`", project.name))?;
         Ok(())
@@ -1229,9 +1268,9 @@ fn write_cache_metadata(
     task_hash: &TaskHash,
     stdout: CacheArtifactMetadata,
     stderr: CacheArtifactMetadata,
-    build_archive: Option<CacheArtifactMetadata>,
+    output_archive: Option<CacheArtifactMetadata>,
 ) -> Result<()> {
-    let metadata = CacheEntryMetadata::from_task_hash(task_hash, stdout, stderr, build_archive);
+    let metadata = CacheEntryMetadata::from_task_hash(task_hash, stdout, stderr, output_archive);
     let metadata_json =
         serde_json::to_string_pretty(&metadata).context("failed to serialize cache metadata")?;
     fs::write(path, metadata_json).with_context(|| format!("failed to write {}", path.display()))
@@ -1307,7 +1346,7 @@ impl CacheEntryMetadata {
         task_hash: &TaskHash,
         stdout: CacheArtifactMetadata,
         stderr: CacheArtifactMetadata,
-        build_archive: Option<CacheArtifactMetadata>,
+        output_archive: Option<CacheArtifactMetadata>,
     ) -> Self {
         Self {
             schema_version: task_hash.schema_version.clone(),
@@ -1322,9 +1361,10 @@ impl CacheEntryMetadata {
             hash: task_hash.hash.clone(),
             gleam_version: task_hash.gleam_version.clone(),
             input_globs: task_hash.input_globs.clone(),
+            cached_folders: task_hash.cached_folders.clone(),
             stdout,
             stderr,
-            build_archive,
+            output_archive,
             created_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -1344,6 +1384,7 @@ impl CacheEntryMetadata {
             && self.command == task_hash.command
             && self.hash == task_hash.hash
             && self.gleam_version == task_hash.gleam_version
+            && self.cached_folders == task_hash.cached_folders
     }
 }
 
@@ -1422,14 +1463,14 @@ fn is_complete_build_cache_entry(entry_dir: &Path, task_hash: &TaskHash) -> Resu
     let Some(metadata) = read_valid_metadata(entry_dir, task_hash)? else {
         return Ok(false);
     };
-    let Some(build_archive) = metadata.build_archive.as_ref() else {
+    let Some(output_archive) = metadata.output_archive.as_ref() else {
         return Ok(false);
     };
 
     Ok(
         artifact_matches(&entry_dir.join("stdout.txt"), &metadata.stdout)?
             && artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?
-            && artifact_matches(&entry_dir.join("build.tar.zst"), build_archive)?,
+            && artifact_matches(&entry_dir.join("outputs.tar.zst"), output_archive)?,
     )
 }
 
@@ -1438,7 +1479,7 @@ fn is_complete_output_cache_entry(entry_dir: &Path, task_hash: &TaskHash) -> Res
         return Ok(false);
     };
 
-    Ok(metadata.build_archive.is_none()
+    Ok(metadata.output_archive.is_none()
         && artifact_matches(&entry_dir.join("stdout.txt"), &metadata.stdout)?
         && artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?)
 }
@@ -1475,15 +1516,28 @@ fn hash_cache_artifact(path: &Path) -> Result<CacheArtifactMetadata> {
     })
 }
 
-fn write_build_archive(archive_path: &Path, build_dir: &Path) -> Result<()> {
+fn write_build_outputs_archive(
+    archive_path: &Path,
+    project: &Project,
+    cached_folders: &[String],
+) -> Result<()> {
     let archive_file = File::create(archive_path)
         .with_context(|| format!("failed to create {}", archive_path.display()))?;
     let encoder = zstd::stream::write::Encoder::new(archive_file, 0)
         .context("failed to create zstd encoder")?;
     let mut archive = tar::Builder::new(encoder);
-    archive
-        .append_dir_all("build", build_dir)
-        .with_context(|| format!("failed to append {} to build archive", build_dir.display()))?;
+    for folder in cached_folders {
+        let output_dir = project.root.join(folder);
+        ensure_directory_tree_has_no_symlinks(&output_dir)?;
+        archive
+            .append_dir_all(folder, &output_dir)
+            .with_context(|| {
+                format!(
+                    "failed to append {} to output archive",
+                    output_dir.display()
+                )
+            })?;
+    }
     let encoder = archive
         .into_inner()
         .context("failed to finish tar archive")?;
@@ -1491,7 +1545,56 @@ fn write_build_archive(archive_path: &Path, build_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn restore_build_archive(project: &Project, archive_path: &Path) -> Result<()> {
+fn ensure_directory_tree_has_no_symlinks(root: &Path) -> Result<()> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
+        if entry.file_type().is_symlink() {
+            bail!(
+                "cached folder {} contains symlink {}",
+                root.display(),
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_cached_folder_parent_is_safe(project: &Project, folder: &str) -> Result<()> {
+    let components = Path::new(folder).components().collect::<Vec<_>>();
+    let mut current = project.root.clone();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "cached folder {} has symlink parent {}",
+                    project.root.join(folder).display(),
+                    current.display()
+                );
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!(
+                    "cached folder {} has non-directory parent {}",
+                    project.root.join(folder).display(),
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_build_outputs(
+    project: &Project,
+    task_hash: &TaskHash,
+    archive_path: &Path,
+) -> Result<()> {
     let temp_dir = project
         .root
         .join(format!(".gomo-restore-{}", unique_suffix()));
@@ -1500,14 +1603,14 @@ fn restore_build_archive(project: &Project, archive_path: &Path) -> Result<()> {
     }
     fs::create_dir(&temp_dir).with_context(|| {
         format!(
-            "failed to create build restore temp directory {}",
+            "failed to create build output restore temp directory {}",
             temp_dir.display()
         )
     })?;
 
     let restore_result = (|| -> Result<()> {
-        unpack_build_archive(archive_path, &temp_dir)?;
-        install_restored_build(project, &temp_dir)
+        unpack_build_outputs_archive(archive_path, &temp_dir, &task_hash.cached_folders)?;
+        install_restored_build_outputs(project, &temp_dir, &task_hash.cached_folders)
     })();
 
     let cleanup_result = if temp_dir.exists() {
@@ -1520,25 +1623,32 @@ fn restore_build_archive(project: &Project, archive_path: &Path) -> Result<()> {
     restore_result.and(cleanup_result)
 }
 
-fn unpack_build_archive(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+fn unpack_build_outputs_archive(
+    archive_path: &Path,
+    temp_dir: &Path,
+    cached_folders: &[String],
+) -> Result<()> {
     let archive_file = File::open(archive_path)
         .with_context(|| format!("failed to open {}", archive_path.display()))?;
     let decoder =
         zstd::stream::read::Decoder::new(archive_file).context("failed to create zstd decoder")?;
     let mut archive = tar::Archive::new(decoder);
 
-    for entry in archive.entries().context("failed to read build archive")? {
-        let mut entry = entry.context("failed to read build archive entry")?;
+    for entry in archive
+        .entries()
+        .context("failed to read build output archive")?
+    {
+        let mut entry = entry.context("failed to read build output archive entry")?;
         let relative_path = entry
             .path()
-            .context("failed to read build archive path")?
+            .context("failed to read build output archive path")?
             .into_owned();
-        validate_build_archive_path(&relative_path)?;
+        validate_build_output_archive_path(&relative_path, cached_folders)?;
 
         let entry_type = entry.header().entry_type();
         if !(entry_type.is_file() || entry_type.is_dir()) {
             bail!(
-                "cached build archive contains unsupported entry type at {}",
+                "cached build output archive contains unsupported entry type at {}",
                 relative_path.display()
             );
         }
@@ -1556,79 +1666,104 @@ fn unpack_build_archive(archive_path: &Path, temp_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_build_archive_path(path: &Path) -> Result<()> {
+fn validate_build_output_archive_path(path: &Path, cached_folders: &[String]) -> Result<()> {
     if path.is_absolute() {
-        bail!("cached build archive path {} is absolute", path.display());
-    }
-
-    let mut components = path.components();
-    match components.next() {
-        Some(Component::Normal(component)) if component == "build" => {}
-        _ => bail!(
-            "cached build archive path {} is not under build/",
+        bail!(
+            "cached build output archive path {} is absolute",
             path.display()
-        ),
+        );
     }
 
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
             bail!(
-                "cached build archive path {} must stay inside build/",
+                "cached build output archive path {} contains an invalid component",
                 path.display()
             );
         }
     }
 
+    if !cached_folders
+        .iter()
+        .any(|folder| path.starts_with(Path::new(folder)))
+    {
+        bail!(
+            "cached build output archive path {} is not under a configured cached folder",
+            path.display()
+        );
+    }
+
     Ok(())
 }
 
-fn install_restored_build(project: &Project, temp_dir: &Path) -> Result<()> {
-    let restored_build_dir = temp_dir.join("build");
-    if !is_real_directory(&restored_build_dir)? {
-        bail!("cached build archive did not contain build/");
-    }
-
-    let build_dir = project.root.join("build");
-    let backup_dir = project
-        .root
-        .join(format!(".gomo-build-backup-{}", unique_suffix()));
-    let had_existing_build = build_dir.exists();
-
-    if backup_dir.exists() {
-        remove_path(&backup_dir)?;
-    }
-    if had_existing_build {
-        fs::rename(&build_dir, &backup_dir).with_context(|| {
-            format!(
-                "failed to move existing build directory from {} to {}",
-                build_dir.display(),
-                backup_dir.display()
-            )
-        })?;
-    }
-
-    let install_result = fs::rename(&restored_build_dir, &build_dir).with_context(|| {
-        format!(
-            "failed to restore cached build directory from {} to {}",
-            restored_build_dir.display(),
-            build_dir.display()
-        )
-    });
-
-    match install_result {
-        Ok(()) => {
-            if had_existing_build {
-                remove_path(&backup_dir)?;
-            }
-            Ok(())
-        }
-        Err(error) => {
-            if had_existing_build && !build_dir.exists() {
-                let _ = fs::rename(&backup_dir, &build_dir);
-            }
-            Err(error)
+fn install_restored_build_outputs(
+    project: &Project,
+    temp_dir: &Path,
+    cached_folders: &[String],
+) -> Result<()> {
+    for folder in cached_folders {
+        ensure_cached_folder_parent_is_safe(project, folder)?;
+        if !is_real_directory(&temp_dir.join(folder))? {
+            bail!("cached build output archive did not contain {folder}/");
         }
     }
+
+    let backup_root = temp_dir.join(format!(".gomo-backups-{}", unique_suffix()));
+    fs::create_dir(&backup_root)
+        .with_context(|| format!("failed to create {}", backup_root.display()))?;
+    let mut backed_up = Vec::new();
+    let mut installed = Vec::new();
+
+    let install_result = (|| -> Result<()> {
+        for (index, folder) in cached_folders.iter().enumerate() {
+            let destination = project.root.join(folder);
+            if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
+                let backup = backup_root.join(index.to_string());
+                fs::rename(&destination, &backup).with_context(|| {
+                    format!(
+                        "failed to move existing cached folder from {} to {}",
+                        destination.display(),
+                        backup.display()
+                    )
+                })?;
+                backed_up.push((destination.clone(), backup));
+            }
+        }
+
+        for folder in cached_folders {
+            let restored = temp_dir.join(folder);
+            let destination = project.root.join(folder);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create output parent {}", parent.display())
+                })?;
+            }
+            fs::rename(&restored, &destination).with_context(|| {
+                format!(
+                    "failed to restore cached folder from {} to {}",
+                    restored.display(),
+                    destination.display()
+                )
+            })?;
+            installed.push(destination);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = install_result {
+        for destination in installed.iter().rev() {
+            let _ = remove_path(destination);
+        }
+        for (destination, backup) in backed_up.iter().rev() {
+            if !destination.exists() {
+                let _ = fs::rename(backup, destination);
+            }
+        }
+        return Err(error);
+    }
+
+    remove_path(&backup_root)?;
+    Ok(())
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -2236,7 +2371,7 @@ version = "0.1.0"
         assert!(entry_dir.join("meta.json").is_file());
         assert!(entry_dir.join("stdout.txt").is_file());
         assert!(entry_dir.join("stderr.txt").is_file());
-        assert!(entry_dir.join("build.tar.zst").is_file());
+        assert!(entry_dir.join("outputs.tar.zst").is_file());
 
         fs::remove_dir_all(shared.root.join("build")).expect("build dir should be removed");
 
@@ -2255,6 +2390,108 @@ version = "0.1.0"
             .expect("restored build artifact should be readable"),
             "compiled\n"
         );
+    }
+
+    #[test]
+    fn stores_and_replaces_multiple_cached_build_folders() {
+        let test_workspace = TestWorkspace::new("gomo-cache-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "apps/web",
+            r#"
+name = "web"
+version = "0.1.0"
+
+[tools.gomo.build]
+cached_folders = ["build", "dist"]
+"#,
+        );
+        test_workspace.write_file("apps/web/src/main.gleam", "pub fn main() { Nil }\n");
+        test_workspace.write_file("apps/web/build/app.mjs", "compiled\n");
+        test_workspace.write_file("apps/web/dist/app.js", "bundled\n");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let web = project(&workspace, "web");
+        let task_hash = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            web,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should compute");
+
+        store_successful_build(
+            &workspace,
+            web,
+            &task_hash,
+            &TaskExecution::success("built\n", ""),
+        )
+        .expect("build outputs should be cached");
+
+        fs::remove_dir_all(web.root.join("build")).expect("build should be removed");
+        fs::write(web.root.join("dist/app.js"), "stale\n").expect("dist should become stale");
+        fs::write(web.root.join("dist/stale.js"), "stale\n").expect("stale file should exist");
+
+        restore_successful_build(&workspace, web, &task_hash)
+            .expect("cache restore should succeed")
+            .expect("cache entry should hit");
+
+        assert_eq!(
+            fs::read_to_string(web.root.join("build/app.mjs")).expect("build should restore"),
+            "compiled\n"
+        );
+        assert_eq!(
+            fs::read_to_string(web.root.join("dist/app.js")).expect("dist should restore"),
+            "bundled\n"
+        );
+        assert!(!web.root.join("dist/stale.js").exists());
+    }
+
+    #[test]
+    fn cached_folder_configuration_participates_in_build_hashes() {
+        let test_workspace = TestWorkspace::new("gomo-cache-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "apps/web",
+            r#"
+name = "web"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file("apps/web/src/main.gleam", "pub fn main() { Nil }\n");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let before = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            project(&workspace, "web"),
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("default build hash should compute");
+
+        test_workspace.write_manifest(
+            "apps/web",
+            r#"
+name = "web"
+version = "0.1.0"
+
+[tools.gomo.build]
+cached_folders = ["build", "dist"]
+"#,
+        );
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let after = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            project(&workspace, "web"),
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("custom build hash should compute");
+
+        assert_eq!(before.cached_folders, vec!["build"]);
+        assert_eq!(after.cached_folders, vec!["build", "dist"]);
+        assert_ne!(before.hash, after.hash);
     }
 
     #[test]
@@ -2299,7 +2536,7 @@ version = "0.1.0"
         assert!(entry_dir.join("meta.json").is_file());
         assert!(entry_dir.join("stdout.txt").is_file());
         assert!(entry_dir.join("stderr.txt").is_file());
-        assert!(!entry_dir.join("build.tar.zst").exists());
+        assert!(!entry_dir.join("outputs.tar.zst").exists());
 
         let cached = restore_successful_test(&workspace, &task_hash)
             .expect("cache restore should succeed")
@@ -2391,7 +2628,7 @@ version = "0.1.0"
         .expect("successful build should be cached");
 
         let entry_dir = task_cache_entry_dir(&workspace, &task_hash);
-        fs::write(entry_dir.join("build.tar.zst"), "corrupted\n")
+        fs::write(entry_dir.join("outputs.tar.zst"), "corrupted\n")
             .expect("cached archive should be overwritten");
 
         assert!(
@@ -2439,7 +2676,7 @@ version = "0.1.0"
         assert!(entry_dir.join("meta.json").is_file());
         assert!(entry_dir.join("stdout.txt").is_file());
         assert!(entry_dir.join("stderr.txt").is_file());
-        assert!(!entry_dir.join("build.tar.zst").exists());
+        assert!(!entry_dir.join("outputs.tar.zst").exists());
 
         let cached = restore_successful_format(&workspace, &task_hash)
             .expect("cache restore should succeed")
@@ -2549,11 +2786,19 @@ version = "0.1.0"
     }
 
     #[test]
-    fn validates_cached_build_archive_paths() {
-        assert!(validate_build_archive_path(Path::new("build/output.txt")).is_ok());
-        assert!(validate_build_archive_path(Path::new("src/output.txt")).is_err());
-        assert!(validate_build_archive_path(Path::new("build/../output.txt")).is_err());
-        assert!(validate_build_archive_path(Path::new("/build/output.txt")).is_err());
+    fn validates_cached_build_output_archive_paths() {
+        let folders = vec!["build".to_string(), "dist".to_string()];
+        assert!(
+            validate_build_output_archive_path(Path::new("build/output.txt"), &folders).is_ok()
+        );
+        assert!(validate_build_output_archive_path(Path::new("dist/app.js"), &folders).is_ok());
+        assert!(validate_build_output_archive_path(Path::new("src/output.txt"), &folders).is_err());
+        assert!(
+            validate_build_output_archive_path(Path::new("build/../output.txt"), &folders).is_err()
+        );
+        assert!(
+            validate_build_output_archive_path(Path::new("/build/output.txt"), &folders).is_err()
+        );
     }
 
     #[test]
