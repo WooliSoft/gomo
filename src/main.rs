@@ -2,6 +2,7 @@ mod affected;
 mod cache;
 mod cli;
 mod commands;
+mod completion;
 mod dependency_versions;
 mod gleam_lock;
 mod gleam_toml;

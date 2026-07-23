@@ -1,13 +1,14 @@
 use anyhow::{Result, bail};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, ColorChoice, CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use clap_complete::{ArgValueCandidates, Shell};
 use std::env;
 use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::commands::{self, CommandOutput, OutputOptions};
+use crate::completion;
 use crate::runner::{CommandOptions, Target};
 
 const HELP_STYLES: Styles = Styles::styled()
@@ -97,7 +98,7 @@ enum Commands {
         #[arg(long, value_enum)]
         target: Target,
         /// Project name to explain.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
         project: String,
     },
     /// Inspect the workspace dependency graph.
@@ -122,7 +123,7 @@ enum Commands {
         #[arg(long, value_enum)]
         target: Target,
         /// Project name to run.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
         project: String,
         /// Include all upstream workspace dependencies.
         #[arg(long)]
@@ -137,10 +138,15 @@ enum Commands {
         #[arg(long)]
         all: bool,
         /// Run one project.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
         project: Option<String>,
         /// Run a comma-separated or repeated project list.
-        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            num_args = 1..,
+            add = ArgValueCandidates::new(completion::project_candidates)
+        )]
         projects: Vec<String>,
         /// Include all upstream workspace dependencies.
         #[arg(long)]
@@ -163,16 +169,24 @@ enum DepsCommands {
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct ProjectSelectionArgs {
     /// Project name to run.
-    #[arg(value_name = "PROJECT")]
+    #[arg(
+        value_name = "PROJECT",
+        add = ArgValueCandidates::new(completion::project_candidates)
+    )]
     positional_project: Option<String>,
     /// Run every discovered project.
     #[arg(long)]
     all: bool,
     /// Run one project.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
     project: Option<String>,
     /// Run a comma-separated or repeated project list.
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        add = ArgValueCandidates::new(completion::project_candidates)
+    )]
     projects: Vec<String>,
     /// Include all upstream workspace dependencies.
     #[arg(long)]
@@ -181,6 +195,7 @@ struct ProjectSelectionArgs {
 
 /// Parse CLI arguments and run the requested command.
 pub fn run() -> Result<()> {
+    completion::handle_dynamic_completion(Cli::command);
     let cwd = std::env::current_dir()?;
     let interactive_terminal = should_use_rich_output();
     let stdout = execute_from_with_terminal(
@@ -195,6 +210,11 @@ pub fn run() -> Result<()> {
         std::process::exit(stdout.exit_code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn command() -> clap::Command {
+    Cli::command()
 }
 
 #[cfg(test)]
@@ -456,10 +476,7 @@ fn run_many_selection(
 }
 
 fn generate_completions(shell: Shell) -> Result<CommandOutput> {
-    let mut command = Cli::command();
-    let mut buffer = Vec::new();
-    clap_complete::generate(shell, &mut command, "gomo", &mut buffer);
-    Ok(CommandOutput::success(String::from_utf8(buffer)?))
+    completion::generate_registration(shell)
 }
 
 #[cfg(test)]
@@ -556,21 +573,7 @@ mod tests {
             execute_args(&["completions", "bash"]).expect("completion script should be generated");
 
         assert!(stdout.contains("_gomo"));
-        assert!(stdout.contains("affected"));
-        assert!(stdout.contains("build"));
-        assert!(stdout.contains("clean"));
-        assert!(stdout.contains("completions"));
-        assert!(stdout.contains("deps"));
-        assert!(stdout.contains("doctor"));
-        assert!(stdout.contains("explain"));
-        assert!(stdout.contains("format"));
-        assert!(stdout.contains("graph"));
-        assert!(stdout.contains("init"));
-        assert!(stdout.contains("projects"));
-        assert!(stdout.contains("reset"));
-        assert!(stdout.contains("run"));
-        assert!(stdout.contains("run-many"));
-        assert!(stdout.contains("test"));
+        assert!(stdout.contains("COMPLETE=\"bash\""));
     }
 
     #[test]
