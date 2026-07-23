@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v3";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = "v4";
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -171,7 +171,8 @@ fn compute_task_hash_inner(
     let input_config = effective_input_globs(project, target)?;
     let workspace_input_globs = workspace_input_globs(workspace, target);
     let cached_folders = effective_cached_folders(workspace, project, target)?;
-    let input_files = expand_input_globs(project, &input_config.globs)?;
+    let cached_output_dirs = project_cached_output_dirs(workspace, project)?;
+    let input_files = expand_input_globs(project, &input_config.globs, &cached_output_dirs)?;
     let workspace_input_files = expand_workspace_input_globs(workspace, &workspace_input_globs)?;
     let manifest_hash = hash_file(&project.manifest_path)?.content_hash;
     let environment = collect_environment();
@@ -471,14 +472,18 @@ fn dedupe_preserving_order(values: Vec<String>) -> Vec<String> {
     deduped
 }
 
-fn expand_input_globs(project: &Project, input_globs: &[String]) -> Result<Vec<HashedInputFile>> {
+fn expand_input_globs(
+    project: &Project,
+    input_globs: &[String],
+    cached_output_dirs: &BTreeSet<PathBuf>,
+) -> Result<Vec<HashedInputFile>> {
     let glob_set = input_glob_set(project, input_globs)?;
     let mut matched_paths = BTreeSet::<PathBuf>::new();
 
     for entry in WalkDir::new(&project.root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !is_restore_work_dir(entry))
+        .filter_entry(|entry| !is_ignored_input_dir(entry, cached_output_dirs))
     {
         let entry = entry.with_context(|| format!("failed to walk {}", project.root.display()))?;
         if !entry.file_type().is_file() {
@@ -513,12 +518,13 @@ fn expand_workspace_input_globs(
     }
 
     let glob_set = workspace_input_glob_set(input_globs)?;
+    let cached_output_dirs = workspace_cached_output_dirs(workspace)?;
     let mut matched_paths = BTreeSet::<PathBuf>::new();
 
     for entry in WalkDir::new(&workspace.root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !is_restore_work_dir(entry))
+        .filter_entry(|entry| !is_ignored_input_dir(entry, &cached_output_dirs))
     {
         let entry =
             entry.with_context(|| format!("failed to walk {}", workspace.root.display()))?;
@@ -548,13 +554,32 @@ fn expand_workspace_input_globs(
         .collect()
 }
 
-fn is_restore_work_dir(entry: &walkdir::DirEntry) -> bool {
+fn project_cached_output_dirs(
+    workspace: &Workspace,
+    project: &Project,
+) -> Result<BTreeSet<PathBuf>> {
+    Ok(effective_cached_folders(workspace, project, Target::Build)?
+        .iter()
+        .map(|folder| project.root.join(folder))
+        .collect())
+}
+
+fn workspace_cached_output_dirs(workspace: &Workspace) -> Result<BTreeSet<PathBuf>> {
+    let mut output_dirs = BTreeSet::new();
+    for project in &workspace.projects {
+        output_dirs.extend(project_cached_output_dirs(workspace, project)?);
+    }
+    Ok(output_dirs)
+}
+
+fn is_ignored_input_dir(entry: &walkdir::DirEntry, cached_output_dirs: &BTreeSet<PathBuf>) -> bool {
     entry.depth() > 0
         && entry.file_type().is_dir()
-        && entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(RESTORE_WORK_DIR_PREFIX)
+        && (cached_output_dirs.contains(entry.path())
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RESTORE_WORK_DIR_PREFIX))
 }
 
 fn input_glob_set(project: &Project, input_globs: &[String]) -> Result<globset::GlobSet> {
@@ -1544,17 +1569,24 @@ fn write_build_outputs_archive(
     let encoder = zstd::stream::write::Encoder::new(archive_file, 0)
         .context("failed to create zstd encoder")?;
     let mut archive = tar::Builder::new(encoder);
+    let cached_output_dirs = cached_folders
+        .iter()
+        .map(|folder| {
+            let output_dir = project.root.join(folder);
+            let canonical_dir = output_dir
+                .canonicalize()
+                .with_context(|| format!("failed to resolve cached folder {folder}"))?;
+            Ok((canonical_dir, PathBuf::from(folder)))
+        })
+        .collect::<Result<Vec<(PathBuf, PathBuf)>>>()?;
     for folder in cached_folders {
         let output_dir = project.root.join(folder);
-        ensure_directory_tree_has_no_symlinks(&output_dir)?;
-        archive
-            .append_dir_all(folder, &output_dir)
-            .with_context(|| {
-                format!(
-                    "failed to append {} to output archive",
-                    output_dir.display()
-                )
-            })?;
+        append_cached_output_tree(
+            &mut archive,
+            &output_dir,
+            Path::new(folder),
+            &cached_output_dirs,
+        )?;
     }
     let encoder = archive
         .into_inner()
@@ -1563,18 +1595,101 @@ fn write_build_outputs_archive(
     Ok(())
 }
 
-fn ensure_directory_tree_has_no_symlinks(root: &Path) -> Result<()> {
+fn append_cached_output_tree<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    root: &Path,
+    archive_root: &Path,
+    cached_output_dirs: &[(PathBuf, PathBuf)],
+) -> Result<()> {
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
+        let relative_path = entry.path().strip_prefix(root).with_context(|| {
+            format!(
+                "failed to compute relative path for {} from {}",
+                entry.path().display(),
+                root.display()
+            )
+        })?;
+        let archive_path = archive_root.join(relative_path);
+
         if entry.file_type().is_symlink() {
-            bail!(
-                "cached folder {} contains symlink {}",
-                root.display(),
-                entry.path().display()
-            );
+            let target = entry.path().canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve cached output symlink {}",
+                    entry.path().display()
+                )
+            })?;
+            let target_archive_path = cached_output_dirs
+                .iter()
+                .find_map(|(output_dir, output_archive_root)| {
+                    target
+                        .strip_prefix(output_dir)
+                        .ok()
+                        .map(|relative_target| output_archive_root.join(relative_target))
+                })
+                .with_context(|| {
+                    format!(
+                        "cached output symlink {} resolves outside configured cached folders",
+                        entry.path().display()
+                    )
+                })?;
+            let link_parent = archive_path.parent().unwrap_or(Path::new(""));
+            let link_target = relative_path_between(link_parent, &target_archive_path)?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata(&metadata);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            archive
+                .append_link(&mut header, &archive_path, &link_target)
+                .with_context(|| {
+                    format!(
+                        "failed to append cached output symlink {}",
+                        entry.path().display()
+                    )
+                })?;
+        } else {
+            archive
+                .append_path_with_name(entry.path(), &archive_path)
+                .with_context(|| {
+                    format!(
+                        "failed to append {} to output archive",
+                        entry.path().display()
+                    )
+                })?;
         }
     }
     Ok(())
+}
+
+fn relative_path_between(from: &Path, to: &Path) -> Result<PathBuf> {
+    let from_components = from.components().collect::<Vec<_>>();
+    let to_components = to.components().collect::<Vec<_>>();
+    if from_components
+        .iter()
+        .chain(&to_components)
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("cannot compute relative path between archive paths");
+    }
+
+    let common = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in common..from_components.len() {
+        relative.push("..");
+    }
+    for component in &to_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Ok(relative)
 }
 
 fn ensure_cached_folder_parent_is_safe(project: &Project, folder: &str) -> Result<()> {
@@ -1651,6 +1766,7 @@ fn unpack_build_outputs_archive(
     let decoder =
         zstd::stream::read::Decoder::new(archive_file).context("failed to create zstd decoder")?;
     let mut archive = tar::Archive::new(decoder);
+    let mut symlinks = Vec::new();
 
     for entry in archive
         .entries()
@@ -1664,6 +1780,17 @@ fn unpack_build_outputs_archive(
         validate_build_output_archive_path(&relative_path, cached_folders)?;
 
         let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() {
+            let link_target = entry
+                .link_name()
+                .context("failed to read cached build symlink target")?
+                .context("cached build symlink is missing its target")?
+                .into_owned();
+            let resolved_target =
+                resolve_archive_symlink_target(&relative_path, &link_target, cached_folders)?;
+            symlinks.push((relative_path, link_target, resolved_target));
+            continue;
+        }
         if !(entry_type.is_file() || entry_type.is_dir()) {
             bail!(
                 "cached build output archive contains unsupported entry type at {}",
@@ -1681,7 +1808,90 @@ fn unpack_build_outputs_archive(
         })?;
     }
 
+    for (relative_path, link_target, resolved_target) in symlinks {
+        if !temp_dir.join(&resolved_target).exists() {
+            bail!(
+                "cached build symlink {} points to missing target {}",
+                relative_path.display(),
+                resolved_target.display()
+            );
+        }
+        let destination = temp_dir.join(&relative_path);
+        create_symlink(&link_target, &destination, &temp_dir.join(&resolved_target))?;
+    }
+
     Ok(())
+}
+
+fn resolve_archive_symlink_target(
+    symlink_path: &Path,
+    link_target: &Path,
+    cached_folders: &[String],
+) -> Result<PathBuf> {
+    if link_target.is_absolute() {
+        bail!(
+            "cached build symlink {} has absolute target {}",
+            symlink_path.display(),
+            link_target.display()
+        );
+    }
+
+    let mut resolved = symlink_path.parent().unwrap_or(Path::new("")).to_path_buf();
+    for component in link_target.components() {
+        match component {
+            Component::Normal(value) => resolved.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    bail!(
+                        "cached build symlink {} leaves configured cached folders",
+                        symlink_path.display()
+                    );
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "cached build symlink {} has invalid target {}",
+                    symlink_path.display(),
+                    link_target.display()
+                );
+            }
+        }
+    }
+    validate_build_output_archive_path(&resolved, cached_folders).with_context(|| {
+        format!(
+            "cached build symlink {} leaves configured cached folders",
+            symlink_path.display()
+        )
+    })?;
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn create_symlink(link_target: &Path, destination: &Path, _resolved_target: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(link_target, destination).with_context(|| {
+        format!(
+            "failed to create cached build symlink {} -> {}",
+            destination.display(),
+            link_target.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn create_symlink(link_target: &Path, destination: &Path, resolved_target: &Path) -> Result<()> {
+    let result = if resolved_target.is_dir() {
+        std::os::windows::fs::symlink_dir(link_target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(link_target, destination)
+    };
+    result.with_context(|| {
+        format!(
+            "failed to create cached build symlink {} -> {}",
+            destination.display(),
+            link_target.display()
+        )
+    })
 }
 
 fn validate_build_output_archive_path(path: &Path, cached_folders: &[String]) -> Result<()> {
@@ -2295,7 +2505,7 @@ version = "0.1.0"
     }
 
     #[test]
-    fn restore_work_directories_do_not_participate_in_hashes() {
+    fn cache_work_and_output_directories_do_not_participate_in_hashes() {
         let test_workspace = TestWorkspace::new("gomo-cache-test");
         test_workspace.write_file(
             "gomo.toml",
@@ -2315,6 +2525,7 @@ version = "0.1.0"
 
 [tools.gomo.build]
 inputs = ["**"]
+cached_folders = ["dist"]
 "#,
         );
         test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
@@ -2334,6 +2545,10 @@ inputs = ["**"]
             "libs/shared/.gomo-restore-test/build/dev/erlang/shared/artifact.erl",
             "transient\n",
         );
+        test_workspace.write_file(
+            "libs/shared/dist/dev/erlang/shared/artifact.erl",
+            "compiled\n",
+        );
 
         let after = compute_task_hash_with_gleam_version(
             &workspace,
@@ -2342,7 +2557,7 @@ inputs = ["**"]
             Target::Build,
             GLEAM_VERSION,
         )
-        .expect("build hash should ignore restore work directories");
+        .expect("build hash should ignore cache work and output directories");
 
         assert_eq!(before.hash, after.hash);
         assert_eq!(before.input_files, after.input_files);
@@ -2462,6 +2677,135 @@ version = "0.1.0"
             )
             .expect("restored build artifact should be readable"),
             "compiled\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_internal_build_symlinks_when_restoring() {
+        use std::os::unix::fs::symlink;
+
+        let test_workspace = TestWorkspace::new("gomo-cache-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
+        test_workspace.write_file(
+            "libs/shared/build/packages/lustre/priv/static.txt",
+            "asset\n",
+        );
+        fs::create_dir_all(
+            test_workspace
+                .path()
+                .join("libs/shared/build/dev/javascript/lustre"),
+        )
+        .expect("symlink parent should be created");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let shared = project(&workspace, "shared");
+        symlink(
+            shared.root.join("build/packages/lustre/priv"),
+            shared.root.join("build/dev/javascript/lustre/priv"),
+        )
+        .expect("internal build symlink should be created");
+        let task_hash = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should compute");
+
+        store_successful_build(
+            &workspace,
+            shared,
+            &task_hash,
+            &TaskExecution::success("built\n", ""),
+        )
+        .expect("internal build symlink should be cached");
+        fs::remove_dir_all(shared.root.join("build")).expect("build should be removed");
+
+        restore_successful_build(&workspace, shared, &task_hash)
+            .expect("cache restore should succeed")
+            .expect("cache entry should hit");
+
+        let restored_link = shared.root.join("build/dev/javascript/lustre/priv");
+        assert!(
+            fs::symlink_metadata(&restored_link)
+                .expect("restored path should exist")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&restored_link).expect("restored symlink target should be readable"),
+            Path::new("../../../packages/lustre/priv")
+        );
+        assert_eq!(
+            restored_link
+                .canonicalize()
+                .expect("restored symlink should resolve"),
+            shared
+                .root
+                .join("build/packages/lustre/priv")
+                .canonicalize()
+                .expect("restored target should resolve")
+        );
+        assert_eq!(
+            fs::read_to_string(restored_link.join("static.txt"))
+                .expect("symlinked contents should be readable"),
+            "asset\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_build_symlinks_outside_cached_folders() {
+        use std::os::unix::fs::symlink;
+
+        let test_workspace = TestWorkspace::new("gomo-cache-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
+        fs::create_dir_all(test_workspace.path().join("libs/shared/build"))
+            .expect("build directory should be created");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let shared = project(&workspace, "shared");
+        symlink(
+            shared.root.join("src/main.gleam"),
+            shared.root.join("build/source.gleam"),
+        )
+        .expect("escaping build symlink should be created");
+        let task_hash = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should compute");
+
+        let error = store_successful_build(
+            &workspace,
+            shared,
+            &task_hash,
+            &TaskExecution::success("built\n", ""),
+        )
+        .expect_err("escaping build symlink should be rejected");
+
+        assert!(
+            format!("{error:#}").contains("resolves outside configured cached folders"),
+            "unexpected error: {error:#}"
         );
     }
 
@@ -2871,6 +3215,31 @@ version = "0.1.0"
         );
         assert!(
             validate_build_output_archive_path(Path::new("/build/output.txt"), &folders).is_err()
+        );
+        assert_eq!(
+            resolve_archive_symlink_target(
+                Path::new("build/dev/javascript/lustre/priv"),
+                Path::new("../../../packages/lustre/priv"),
+                &folders,
+            )
+            .expect("internal symlink target should resolve"),
+            Path::new("build/packages/lustre/priv")
+        );
+        assert!(
+            resolve_archive_symlink_target(
+                Path::new("build/dev/javascript/lustre/priv"),
+                Path::new("../../../../src"),
+                &folders,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_archive_symlink_target(
+                Path::new("build/dev/javascript/lustre/priv"),
+                Path::new("/etc/passwd"),
+                &folders,
+            )
+            .is_err()
         );
     }
 
