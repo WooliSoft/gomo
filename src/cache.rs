@@ -21,6 +21,7 @@ pub(crate) const CACHE_SCHEMA_VERSION: &str = "v3";
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const STALE_CACHE_WORK_DIR_SECONDS: u64 = 24 * 60 * 60;
+const RESTORE_WORK_DIR_PREFIX: &str = ".gomo-restore-";
 
 const DEFAULT_BUILD_INPUTS: &[&str] = &[
     "gleam.toml",
@@ -474,7 +475,11 @@ fn expand_input_globs(project: &Project, input_globs: &[String]) -> Result<Vec<H
     let glob_set = input_glob_set(project, input_globs)?;
     let mut matched_paths = BTreeSet::<PathBuf>::new();
 
-    for entry in WalkDir::new(&project.root).follow_links(false) {
+    for entry in WalkDir::new(&project.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_restore_work_dir(entry))
+    {
         let entry = entry.with_context(|| format!("failed to walk {}", project.root.display()))?;
         if !entry.file_type().is_file() {
             continue;
@@ -510,7 +515,11 @@ fn expand_workspace_input_globs(
     let glob_set = workspace_input_glob_set(input_globs)?;
     let mut matched_paths = BTreeSet::<PathBuf>::new();
 
-    for entry in WalkDir::new(&workspace.root).follow_links(false) {
+    for entry in WalkDir::new(&workspace.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_restore_work_dir(entry))
+    {
         let entry =
             entry.with_context(|| format!("failed to walk {}", workspace.root.display()))?;
         if !entry.file_type().is_file() {
@@ -537,6 +546,15 @@ fn expand_workspace_input_globs(
         .into_iter()
         .map(|relative_path| hash_workspace_file(workspace, relative_path))
         .collect()
+}
+
+fn is_restore_work_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(RESTORE_WORK_DIR_PREFIX)
 }
 
 fn input_glob_set(project: &Project, input_globs: &[String]) -> Result<globset::GlobSet> {
@@ -1597,7 +1615,7 @@ fn restore_build_outputs(
 ) -> Result<()> {
     let temp_dir = project
         .root
-        .join(format!(".gomo-restore-{}", unique_suffix()));
+        .join(format!("{RESTORE_WORK_DIR_PREFIX}{}", unique_suffix()));
     if temp_dir.exists() {
         remove_path(&temp_dir)?;
     }
@@ -2274,6 +2292,61 @@ version = "0.1.0"
         assert_eq!(before.workspace_input_globs, ["devenv.nix"]);
         assert_eq!(before.workspace_input_files[0].relative_path, "devenv.nix");
         assert_ne!(before.hash, after.hash);
+    }
+
+    #[test]
+    fn restore_work_directories_do_not_participate_in_hashes() {
+        let test_workspace = TestWorkspace::new("gomo-cache-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["libs/*"]
+
+[workspace.build]
+inputs = ["libs/**"]
+"#,
+        );
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+
+[tools.gomo.build]
+inputs = ["**"]
+"#,
+        );
+        test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let shared = project(&workspace, "shared");
+
+        let before = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should compute");
+
+        test_workspace.write_file(
+            "libs/shared/.gomo-restore-test/build/dev/erlang/shared/artifact.erl",
+            "transient\n",
+        );
+
+        let after = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should ignore restore work directories");
+
+        assert_eq!(before.hash, after.hash);
+        assert_eq!(before.input_files, after.input_files);
+        assert_eq!(before.workspace_input_files, after.workspace_input_files);
     }
 
     #[test]
