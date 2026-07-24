@@ -13,4 +13,4 @@ shared = { path = "../../libs/shared" }
 wisp = ">= 2.2.2 and < 3.0.0"
 
 [dev-dependencies]
-gleeunit = ">= 1.11.0 and < 2.0.0"
+unitest = ">= 1.6.0 and < 2.0.0"

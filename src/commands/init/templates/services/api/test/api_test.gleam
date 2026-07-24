@@ -1,12 +1,17 @@
 import api/router
 import gleam/http.{Get}
 import gleam/json
-import gleeunit
 import shared/api as contract
+import unitest
 import wisp/simulate
 
 pub fn main() {
-  gleeunit.main()
+  unitest.run(
+    unitest.Options(
+      ..unitest.default_options(),
+      execution_mode: unitest.RunParallelAuto,
+    ),
+  )
 }
 
 pub fn health_route_test() {

@@ -13,7 +13,7 @@ rsvp = ">= 2.0.0 and < 3.0.0"
 shared = { path = "../../libs/shared" }
 
 [dev-dependencies]
-gleeunit = ">= 1.11.0 and < 2.0.0"
+unitest = ">= 1.6.0 and < 2.0.0"
 lustre_dev_tools = ">= 2.3.6 and < 3.0.0"
 
 [tools.lustre.dev]

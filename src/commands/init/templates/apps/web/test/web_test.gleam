@@ -1,9 +1,14 @@
-import gleeunit
 import shared/api
+import unitest
 import web/app
 
 pub fn main() {
-  gleeunit.main()
+  unitest.run(
+    unitest.Options(
+      ..unitest.default_options(),
+      execution_mode: unitest.RunParallelAuto,
+    ),
+  )
 }
 
 pub fn successful_health_response_connects_test() {
