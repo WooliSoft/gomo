@@ -1,11 +1,12 @@
 use anyhow::{Result, bail};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Args, ColorChoice, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, Args, ColorChoice, CommandFactory, Parser, Subcommand};
 use clap_complete::{ArgValueCandidates, Shell};
 use std::env;
 use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::commands::{self, CommandOutput, OutputOptions};
 use crate::completion;
@@ -151,6 +152,48 @@ enum Commands {
         /// Include all upstream workspace dependencies.
         #[arg(long)]
         with_deps: bool,
+    },
+    /// Re-run a finite target or callback when relevant workspace files change.
+    Watch {
+        /// Built-in target to run. Omit this when using a callback command.
+        #[arg(long, value_enum)]
+        target: Option<Target>,
+        /// Watch one project and its local dependency closure.
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
+        project: Option<String>,
+        /// Watch every discovered project.
+        #[arg(long)]
+        all: bool,
+        /// Include upstream dependencies in each finite target run.
+        #[arg(long)]
+        with_deps: bool,
+        /// Perform the initial target or callback run (the default).
+        #[arg(long, action = ArgAction::SetTrue)]
+        initial_run: bool,
+        /// Skip the initial target or callback run.
+        #[arg(long = "no-initial-run", action = ArgAction::SetTrue)]
+        no_initial_run: bool,
+        /// Wait for this long after the first event before running a batch.
+        #[arg(long, default_value = "300ms", value_parser = parse_duration)]
+        debounce: Duration,
+        /// Callback command, supplied after `--`.
+        #[arg(last = true, value_name = "COMMAND")]
+        callback: Vec<String>,
+    },
+    /// Build one project and manage its long-running development process.
+    Dev {
+        /// Project to build and run.
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
+        project: String,
+        /// Wait for this long after the first event before rebuilding.
+        #[arg(long, default_value = "300ms", value_parser = parse_duration)]
+        debounce: Duration,
+        /// Reload strategy; `hot` falls back to restart until a helper connects.
+        #[arg(long, value_parser = parse_reload_strategy)]
+        reload: Option<crate::gleam_toml::GomoReloadStrategy>,
+        /// Development command, supplied after `--`.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Generate shell completion scripts.
     Completions {
@@ -353,6 +396,46 @@ fn execute_from_with_terminal(
             cache_options,
             output_options,
         ),
+        Some(Commands::Watch {
+            target,
+            project,
+            all,
+            with_deps,
+            initial_run,
+            no_initial_run,
+            debounce,
+            callback,
+        }) => commands::watch::run(
+            cwd,
+            commands::watch::WatchRequest {
+                target,
+                selection: watch_selection(project, all)?,
+                with_deps,
+                initial_run: initial_run || !no_initial_run,
+                debounce,
+                callback,
+                parallelism,
+            },
+            cache_options,
+            output_options,
+        ),
+        Some(Commands::Dev {
+            project,
+            debounce,
+            reload,
+            command,
+        }) => commands::dev::run(
+            cwd,
+            commands::dev::DevRequest {
+                project,
+                command,
+                debounce,
+                reload,
+                parallelism,
+            },
+            cache_options,
+            output_options,
+        ),
         Some(Commands::Completions { shell }) => generate_completions(shell),
         None => {
             let mut command = Cli::command();
@@ -475,6 +558,40 @@ fn run_many_selection(
     Ok(commands::run::ProjectSelection::Projects(projects))
 }
 
+fn watch_selection(project: Option<String>, all: bool) -> Result<commands::run::ProjectSelection> {
+    if project.is_some() && all {
+        bail!("watch accepts only one of --project or --all");
+    }
+    if let Some(project) = project {
+        return Ok(commands::run::ProjectSelection::Project(project));
+    }
+    Ok(commands::run::ProjectSelection::All)
+}
+
+fn parse_reload_strategy(
+    value: &str,
+) -> std::result::Result<crate::gleam_toml::GomoReloadStrategy, String> {
+    value.parse()
+}
+
+fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000u64)
+    } else {
+        return Err("duration must end in `ms` or `s`".to_string());
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "duration must contain a non-negative integer".to_string())?;
+    let milliseconds = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_string())?;
+    Ok(Duration::from_millis(milliseconds))
+}
+
 fn generate_completions(shell: Shell) -> Result<CommandOutput> {
     completion::generate_registration(shell)
 }
@@ -514,6 +631,8 @@ mod tests {
         assert!(stdout.contains("run"));
         assert!(stdout.contains("run-many"));
         assert!(stdout.contains("test"));
+        assert!(stdout.contains("watch"));
+        assert!(stdout.contains("dev"));
     }
 
     #[test]
@@ -813,6 +932,67 @@ version = "0.1.0"
                 "shared".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn parses_watch_callback_and_initial_run_options() {
+        let cli = Cli::try_parse_from([
+            "gomo",
+            "watch",
+            "--project",
+            "demo",
+            "--no-initial-run",
+            "--debounce",
+            "250ms",
+            "--",
+            "./scripts/generate.sh",
+            "--check",
+        ])
+        .expect("watch arguments should parse");
+
+        let Some(Commands::Watch {
+            project,
+            no_initial_run,
+            callback,
+            debounce,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected watch command");
+        };
+        assert_eq!(project.as_deref(), Some("demo"));
+        assert!(no_initial_run);
+        assert_eq!(callback, ["./scripts/generate.sh", "--check"]);
+        assert_eq!(debounce, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parses_dev_command_and_reload_strategy() {
+        let cli = Cli::try_parse_from([
+            "gomo",
+            "dev",
+            "--project",
+            "demo",
+            "--reload",
+            "hot",
+            "--",
+            "gleam",
+            "run",
+        ])
+        .expect("dev arguments should parse");
+
+        let Some(Commands::Dev {
+            project,
+            command,
+            reload,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected dev command");
+        };
+        assert_eq!(project, "demo");
+        assert_eq!(command, ["gleam", "run"]);
+        assert_eq!(reload, Some(crate::gleam_toml::GomoReloadStrategy::Hot));
     }
 
     #[test]

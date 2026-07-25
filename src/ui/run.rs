@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        is_raw_mode_enabled,
+    },
 };
 use ratatui::{
     Frame, Terminal,
@@ -17,12 +21,146 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 
+use crate::cancellation::CancellationToken;
 use crate::commands::run::{TaskCacheStatus, TaskOutcome, TaskStatus, TaskSummary};
 use crate::runner::Target;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+#[derive(Clone)]
+pub(crate) struct RunManyControl {
+    input: Arc<Mutex<mpsc::Receiver<KeyCode>>>,
+    continuous: bool,
+    cancellation: CancellationToken,
+    idle_terminal: Weak<Mutex<Option<RunManyTerminal>>>,
+}
+
+impl RunManyControl {
+    pub(crate) fn take_idle_terminal(&self) -> io::Result<Option<RunManyTerminal>> {
+        let Some(idle_terminal) = self.idle_terminal.upgrade() else {
+            return Ok(None);
+        };
+        let mut idle_terminal = idle_terminal
+            .lock()
+            .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
+        Ok(idle_terminal.take())
+    }
+
+    pub(crate) fn store_idle_terminal(&self, terminal: RunManyTerminal) -> io::Result<()> {
+        let Some(idle_terminal) = self.idle_terminal.upgrade() else {
+            return Ok(());
+        };
+        let mut idle_terminal = idle_terminal
+            .lock()
+            .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
+        *idle_terminal = Some(terminal);
+        Ok(())
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn show_watch_error(&self, message: impl Into<String>) -> io::Result<()> {
+        let Some(idle_terminal) = self.idle_terminal.upgrade() else {
+            return Ok(());
+        };
+        let mut idle_terminal = idle_terminal
+            .lock()
+            .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
+        if let Some(terminal) = idle_terminal.as_mut() {
+            terminal.show_watch_error(message.into())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn show_waiting(
+        &self,
+        project_names: &[String],
+        target: Target,
+        parallelism: usize,
+    ) -> io::Result<()> {
+        let Some(idle_terminal) = self.idle_terminal.upgrade() else {
+            return Ok(());
+        };
+        let mut idle_terminal = idle_terminal
+            .lock()
+            .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
+        if let Some(terminal) = idle_terminal.as_mut() {
+            return terminal.show_waiting();
+        }
+        let mut terminal = RunManyTerminal::new_with_control(
+            project_names,
+            target,
+            BTreeMap::new(),
+            parallelism,
+            Some(self.clone()),
+        );
+        terminal.set_waiting();
+        terminal.start()?;
+        *idle_terminal = Some(terminal);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RunManySession {
+    input: mpsc::Sender<KeyCode>,
+    cancellation: CancellationToken,
+    idle_terminal: Arc<Mutex<Option<RunManyTerminal>>>,
+}
+
+impl RunManySession {
+    pub(crate) fn continuous() -> (Self, RunManyControl) {
+        let (input, receiver) = mpsc::channel();
+        let idle_terminal = Arc::new(Mutex::new(None));
+        let cancellation = CancellationToken::new();
+        let control = RunManyControl {
+            input: Arc::new(Mutex::new(receiver)),
+            continuous: true,
+            cancellation: cancellation.clone(),
+            idle_terminal: Arc::downgrade(&idle_terminal),
+        };
+        (
+            Self {
+                input,
+                cancellation,
+                idle_terminal,
+            },
+            control,
+        )
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(crate) fn handle_key(&self, code: KeyCode) -> io::Result<()> {
+        let mut idle_terminal = self
+            .idle_terminal
+            .lock()
+            .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
+        if let Some(terminal) = idle_terminal.as_mut() {
+            terminal.handle_key(code);
+            terminal.draw()
+        } else {
+            let _ = self.input.send(code);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn show_waiting(
+        &self,
+        project_names: &[String],
+        target: Target,
+        parallelism: usize,
+        control: RunManyControl,
+    ) -> io::Result<()> {
+        control.show_waiting(project_names, target, parallelism)
+    }
+}
 
 pub(crate) struct RunManyTerminal {
     target: Target,
@@ -42,16 +180,20 @@ pub(crate) struct RunManyTerminal {
     skipped: usize,
     summary: Option<TaskSummary>,
     exit_prompt: Option<ExitPrompt>,
+    waiting: bool,
+    watch_error: Option<String>,
     terminal: Option<TuiTerminal>,
     raw_mode_enabled: bool,
+    control: Option<RunManyControl>,
 }
 
 impl RunManyTerminal {
-    pub(crate) fn new(
+    pub(crate) fn new_with_control(
         project_names: &[String],
         target: Target,
         command_displays: BTreeMap<String, String>,
         parallelism: usize,
+        control: Option<RunManyControl>,
     ) -> Self {
         let rows = project_names
             .iter()
@@ -86,17 +228,25 @@ impl RunManyTerminal {
             skipped: 0,
             summary: None,
             exit_prompt: None,
+            waiting: false,
+            watch_error: None,
             terminal: None,
             raw_mode_enabled: false,
+            control,
         }
     }
 
     pub(crate) fn start(&mut self) -> io::Result<()> {
-        enable_raw_mode()?;
-        self.raw_mode_enabled = true;
+        if !is_raw_mode_enabled()? {
+            enable_raw_mode()?;
+            self.raw_mode_enabled = true;
+        }
 
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        if !self.is_continuous() {
+            execute!(stdout, EnterAlternateScreen)?;
+        }
+        execute!(stdout, cursor::Hide)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -159,6 +309,9 @@ impl RunManyTerminal {
     pub(crate) fn finish(&mut self, summary: &TaskSummary) -> io::Result<RunManyExit> {
         self.summary = Some(summary.clone());
         self.draw()?;
+        if self.is_continuous() {
+            return Ok(RunManyExit::Continued);
+        }
         if super::is_agent_environment() {
             self.restore()?;
             return Ok(RunManyExit::AutoExited);
@@ -172,6 +325,24 @@ impl RunManyTerminal {
 
     pub(crate) fn abort(&mut self) -> io::Result<()> {
         self.restore()
+    }
+
+    pub(crate) fn show_waiting(&mut self) -> io::Result<()> {
+        self.set_waiting();
+        self.draw()
+    }
+
+    fn show_watch_error(&mut self, message: String) -> io::Result<()> {
+        self.watch_error = Some(message);
+        self.draw()
+    }
+
+    fn set_waiting(&mut self) {
+        self.waiting = true;
+        self.watch_error = None;
+        for row in self.rows.values_mut() {
+            row.status = TaskRowStatus::Waiting;
+        }
     }
 
     fn finish_row(&mut self, outcome: &TaskOutcome) {
@@ -220,8 +391,10 @@ impl RunManyTerminal {
 
     fn restore(&mut self) -> io::Result<()> {
         if let Some(mut terminal) = self.terminal.take() {
-            execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
-            terminal.show_cursor()?;
+            if !self.is_continuous() {
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
+                terminal.show_cursor()?;
+            }
         }
         if self.raw_mode_enabled {
             disable_raw_mode()?;
@@ -230,15 +403,19 @@ impl RunManyTerminal {
         io::stdout().flush()
     }
 
+    fn is_continuous(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.continuous)
+    }
+
     fn wait_for_exit_confirmation(&mut self) -> io::Result<RunManyExit> {
         loop {
-            if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(key.code) {
-                        return Ok(RunManyExit::UserExited);
-                    }
-                    self.draw()?;
+            if let Some(code) = self.next_key(Duration::from_millis(250))? {
+                if self.handle_key(code) {
+                    return Ok(RunManyExit::UserExited);
                 }
+                self.draw()?;
             }
         }
     }
@@ -248,13 +425,35 @@ impl RunManyTerminal {
             return Ok(());
         }
 
-        while event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                self.handle_key(key.code);
-            }
+        while let Some(code) = self.next_key(Duration::from_millis(0))? {
+            self.handle_key(code);
         }
 
         Ok(())
+    }
+
+    fn next_key(&self, timeout: Duration) -> io::Result<Option<KeyCode>> {
+        let Some(control) = self.control.as_ref() else {
+            if !event::poll(timeout)? {
+                return Ok(None);
+            }
+            return Ok(match event::read()? {
+                Event::Key(key) => Some(key.code),
+                _ => None,
+            });
+        };
+        let receiver = control
+            .input
+            .lock()
+            .map_err(|_| io::Error::other("run TUI input channel lock was poisoned"))?;
+        match receiver.recv_timeout(timeout) {
+            Ok(code) => Ok(Some(code)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "run TUI input closed",
+            )),
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
@@ -328,6 +527,7 @@ struct TaskRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskRowStatus {
+    Waiting,
     Pending,
     Running,
     Succeeded,
@@ -344,6 +544,7 @@ enum ExitPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunManyExit {
     AutoExited,
+    Continued,
     UserExited,
 }
 
@@ -771,7 +972,7 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
         .filter(|row| row.status == TaskRowStatus::Running)
         .count();
     let remaining = app.project_names.len().saturating_sub(app.completed);
-    let status_color = if app.failed > 0 {
+    let status_color = if app.failed > 0 || app.watch_error.is_some() {
         Color::Red
     } else if app.summary.is_some() {
         Color::Green
@@ -783,6 +984,34 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
     } else {
         app.completed * 100 / app.project_names.len()
     };
+    let progress = if app.waiting {
+        Line::from(vec![
+            dim("Watch"),
+            raw("     "),
+            styled("waiting for changes", Color::Cyan, Modifier::BOLD),
+        ])
+    } else {
+        Line::from(vec![
+            dim("Progress"),
+            raw("  "),
+            styled(
+                format!("{} / {} complete", app.completed, app.project_names.len()),
+                status_color,
+                Modifier::BOLD,
+            ),
+            dim(format!("  {percentage}%")),
+        ])
+    };
+    let watch_notice = app.watch_error.as_ref().map_or_else(
+        || Line::from(""),
+        |message| {
+            Line::from(vec![
+                dim("Error"),
+                raw("     "),
+                styled(message.clone(), Color::Red, Modifier::BOLD),
+            ])
+        },
+    );
     let lines = vec![
         Line::from(vec![
             styled("Gomo", status_color, Modifier::BOLD),
@@ -796,17 +1025,8 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
                 app.parallelism
             )),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            dim("Progress"),
-            raw("  "),
-            styled(
-                format!("{} / {} complete", app.completed, app.project_names.len()),
-                status_color,
-                Modifier::BOLD,
-            ),
-            dim(format!("  {percentage}%")),
-        ]),
+        watch_notice,
+        progress,
         Line::from(vec![
             dim("Results"),
             raw("   "),
@@ -845,7 +1065,13 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
 }
 
 fn key_hint(app: &RunManyTerminal) -> &'static str {
-    if app.summary.is_some() {
+    if app
+        .control
+        .as_ref()
+        .is_some_and(|control| control.continuous)
+    {
+        "↑/↓ or j/k select, Enter/L logs, q exits watch"
+    } else if app.summary.is_some() {
         "↑/↓ tasks, Enter/L logs, Esc/q exits"
     } else {
         "↑/↓ or j/k select tasks, L logs"
@@ -858,6 +1084,7 @@ fn status_line(status: TaskRowStatus, spinner_frame: usize) -> Line<'static> {
 
 fn status_spans(status: TaskRowStatus, spinner_frame: usize) -> Vec<Span<'static>> {
     match status {
+        TaskRowStatus::Waiting => vec![dim("watching")],
         TaskRowStatus::Pending => vec![dim("queued")],
         TaskRowStatus::Running => vec![
             styled(
@@ -1004,5 +1231,154 @@ mod tests {
 
         assert!(rendered.contains("with 1 failed task"));
         assert!(rendered.contains("web_app:build"));
+    }
+
+    #[test]
+    fn channel_backed_input_delivers_navigation_keys() {
+        let (session, control) = RunManySession::continuous();
+        let terminal = RunManyTerminal::new_with_control(
+            &["one".to_string(), "two".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control),
+        );
+        session
+            .handle_key(KeyCode::Down)
+            .expect("input should be sent");
+
+        assert_eq!(
+            terminal
+                .next_key(Duration::from_millis(0))
+                .expect("input should be read"),
+            Some(KeyCode::Down)
+        );
+    }
+
+    #[test]
+    fn disconnected_channel_backed_input_returns_an_error() {
+        let (session, control) = RunManySession::continuous();
+        let terminal = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control),
+        );
+        drop(session);
+
+        let error = terminal
+            .next_key(Duration::from_millis(0))
+            .expect_err("closed input should not look like a timeout");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn continuous_tui_returns_to_its_parent_without_waiting() {
+        let (_session, control) = RunManySession::continuous();
+        let mut terminal = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control),
+        );
+        let summary = TaskSummary {
+            target: Target::Build,
+            total: 1,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+            cache_hits: 0,
+            cache_misses: 1,
+            cache_bypassed: 0,
+            outcomes: Vec::new(),
+        };
+
+        assert_eq!(
+            terminal.finish(&summary).expect("TUI should finish"),
+            RunManyExit::Continued
+        );
+    }
+
+    #[test]
+    fn continuous_session_keeps_handling_input_while_idle() {
+        let (session, control) = RunManySession::continuous();
+        let terminal = RunManyTerminal::new_with_control(
+            &["one".to_string(), "two".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control.clone()),
+        );
+        control
+            .store_idle_terminal(terminal)
+            .expect("terminal should be stored");
+
+        session
+            .handle_key(KeyCode::Down)
+            .expect("idle input should be handled");
+
+        let terminal = control
+            .take_idle_terminal()
+            .expect("terminal state should be readable")
+            .expect("terminal should remain stored");
+        assert_eq!(terminal.selected_index, 1);
+    }
+
+    #[test]
+    fn continuous_session_exposes_cancellation_to_active_runs() {
+        let (session, control) = RunManySession::continuous();
+
+        session.cancel();
+
+        assert!(control.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn completed_continuous_terminal_can_return_to_waiting() {
+        let (_session, control) = RunManySession::continuous();
+        let mut terminal = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control),
+        );
+        terminal.completed = 1;
+        terminal.rows.get_mut("one").unwrap().status = TaskRowStatus::Succeeded;
+
+        terminal
+            .show_waiting()
+            .expect("waiting state should render without a terminal");
+
+        assert!(terminal.waiting);
+        assert_eq!(terminal.rows["one"].status, TaskRowStatus::Waiting);
+    }
+
+    #[test]
+    fn continuous_control_surfaces_watch_errors_in_the_idle_terminal() {
+        let (_session, control) = RunManySession::continuous();
+        let terminal = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control.clone()),
+        );
+        control
+            .store_idle_terminal(terminal)
+            .expect("terminal should be stored");
+
+        control
+            .show_watch_error("invalid gomo.toml")
+            .expect("watch error should be shown");
+
+        let terminal = control
+            .take_idle_terminal()
+            .expect("terminal should be readable")
+            .expect("terminal should remain stored");
+        assert_eq!(terminal.watch_error.as_deref(), Some("invalid gomo.toml"));
     }
 }

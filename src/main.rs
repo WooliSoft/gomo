@@ -1,5 +1,6 @@
 mod affected;
 mod cache;
+mod cancellation;
 mod cli;
 mod commands;
 mod completion;

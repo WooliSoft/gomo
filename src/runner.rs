@@ -3,10 +3,12 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
+use crate::cancellation::{CancellationToken, ChildCancellation, configure_process_group};
 use crate::commands::exit_code_from_status;
 use crate::workspace::Project;
 
@@ -172,6 +174,17 @@ pub(crate) trait CommandRunner: Sync {
         emit_stream(output, &execution.stderr);
         execution
     }
+
+    fn run_with_output_and_cancel(
+        &self,
+        project: &Project,
+        target: Target,
+        options: CommandOptions,
+        output: &mut dyn FnMut(&str),
+        _cancellation: &CancellationToken,
+    ) -> TaskExecution {
+        self.run_with_output(project, target, options, output)
+    }
 }
 
 pub(crate) struct GleamCommandRunner;
@@ -211,6 +224,17 @@ impl CommandRunner for GleamCommandRunner {
         options: CommandOptions,
         output: &mut dyn FnMut(&str),
     ) -> TaskExecution {
+        self.run_with_output_and_cancel(project, target, options, output, &CancellationToken::new())
+    }
+
+    fn run_with_output_and_cancel(
+        &self,
+        project: &Project,
+        target: Target,
+        options: CommandOptions,
+        output: &mut dyn FnMut(&str),
+        cancellation: &CancellationToken,
+    ) -> TaskExecution {
         let command_display = match options.command_display(project, target) {
             Ok(command_display) => command_display,
             Err(error) => return TaskExecution::failure(127, "", format!("{error}\n")),
@@ -248,17 +272,15 @@ impl CommandRunner for GleamCommandRunner {
         let (sender, receiver) = mpsc::channel::<ProcessEvent>();
         spawn_reader(stdout, StreamKind::Stdout, sender.clone());
         spawn_reader(stderr, StreamKind::Stderr, sender.clone());
-        thread::spawn(move || {
-            let _ = sender.send(ProcessEvent::Exit(child.wait().map(exit_code_from_status)));
-        });
-
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut readers_finished = 0usize;
         let mut exit_code = None;
+        let mut child_cancellation = ChildCancellation::new(cancellation.clone());
 
         while readers_finished < 2 || exit_code.is_none() {
-            match receiver.recv() {
+            child_cancellation.poll(&mut child);
+            match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(ProcessEvent::Chunk(StreamKind::Stdout, chunk)) => {
                     emit_stream(output, &chunk);
                     stdout.push_str(&chunk);
@@ -268,10 +290,15 @@ impl CommandRunner for GleamCommandRunner {
                     stderr.push_str(&chunk);
                 }
                 Ok(ProcessEvent::ReaderDone) => readers_finished += 1,
-                Ok(ProcessEvent::Exit(result)) => {
-                    exit_code = Some(result.unwrap_or(1));
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if exit_code.is_none() {
+                match child.try_wait() {
+                    Ok(Some(status)) => exit_code = Some(exit_code_from_status(status)),
+                    Ok(None) => {}
+                    Err(_) => exit_code = Some(1),
                 }
-                Err(_) => break,
             }
         }
 
@@ -288,6 +315,7 @@ fn task_command(project: &Project, target: Target, options: CommandOptions) -> R
     let mut command = Command::new(&resolved_command.program);
     command.args(&resolved_command.args);
     command.current_dir(&project.root);
+    configure_process_group(&mut command);
     Ok(command)
 }
 
@@ -300,7 +328,6 @@ enum StreamKind {
 enum ProcessEvent {
     Chunk(StreamKind, String),
     ReaderDone,
-    Exit(std::io::Result<i32>),
 }
 
 fn spawn_reader(
@@ -409,6 +436,36 @@ command = "gleam test --target erlang"
         assert_eq!(test.display, "gleam test --target erlang");
         assert_eq!(test.program, "sh");
         assert_eq!(test.args, ["-c", "gleam test --target erlang"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_a_running_command_and_its_process_group() {
+        let project = project_with_manifest(
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+command = "sleep 10 & wait"
+"#,
+        );
+        let started = std::time::Instant::now();
+
+        let execution = GleamCommandRunner.run_with_output_and_cancel(
+            &project,
+            Target::Build,
+            CommandOptions::default(),
+            &mut |_| {},
+            &{
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                cancellation
+            },
+        );
+
+        assert!(!execution.is_success());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

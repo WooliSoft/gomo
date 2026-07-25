@@ -19,6 +19,8 @@ pub struct GleamManifest {
     pub path_dependencies: Vec<GleamPathDependency>,
     /// Per-target Gomo config declared under `[tools.gomo.<target>]`.
     pub gomo_targets: BTreeMap<String, GomoTargetConfig>,
+    /// Development-process config declared under `[tools.gomo.dev]`.
+    pub gomo_dev: GomoDevConfig,
 }
 
 /// Gomo target config parsed from a package `gleam.toml`.
@@ -32,6 +34,36 @@ pub struct GomoTargetConfig {
     pub check_command: Option<String>,
     /// Optional build output directories to store and restore from cache.
     pub cached_folders: Option<Vec<String>>,
+}
+
+/// Development-process configuration declared under `[tools.gomo.dev]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GomoDevConfig {
+    /// Optional command used to start the long-running development process.
+    pub command: Option<String>,
+    /// Requested reload strategy. Gomo currently treats hot loading as a
+    /// restart fallback until a runtime helper is connected.
+    pub reload: GomoReloadStrategy,
+}
+
+/// Development process reload strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GomoReloadStrategy {
+    #[default]
+    Restart,
+    Hot,
+}
+
+impl std::str::FromStr for GomoReloadStrategy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "restart" => Ok(Self::Restart),
+            "hot" => Ok(Self::Hot),
+            value => Err(format!("reload must be `restart` or `hot`, got `{value}`")),
+        }
+    }
 }
 
 /// A dependency declared with `{ path = "..." }`.
@@ -75,7 +107,7 @@ struct RawTools {
     gomo: RawGomoTools,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct RawGomoTools {
     #[serde(default)]
     build: Option<RawGomoTarget>,
@@ -83,6 +115,22 @@ struct RawGomoTools {
     format: Option<RawGomoTarget>,
     #[serde(default)]
     test: Option<RawGomoTarget>,
+    #[serde(default)]
+    watch: Option<RawGomoTarget>,
+    #[serde(default)]
+    dev: Option<RawGomoDevConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGomoDevConfig {
+    command: Option<String>,
+    #[serde(default = "default_reload_strategy")]
+    reload: String,
+}
+
+fn default_reload_strategy() -> String {
+    "restart".to_string()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -157,12 +205,15 @@ pub fn parse_manifest(path: &Path) -> Result<GleamManifest> {
             .then_with(|| left.path.cmp(&right.path))
     });
 
+    let gomo = manifest.tools.gomo;
+
     Ok(GleamManifest {
         name: manifest.name,
         version: normalize_optional_string(manifest.version),
         target: manifest.target.unwrap_or_else(|| "erlang".to_string()),
         path_dependencies,
-        gomo_targets: collect_gomo_targets(path, manifest.tools.gomo)?,
+        gomo_targets: collect_gomo_targets(path, &gomo)?,
+        gomo_dev: collect_gomo_dev(path, &gomo)?,
     })
 }
 
@@ -175,15 +226,32 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn collect_gomo_targets(
     path: &Path,
-    tools: RawGomoTools,
+    tools: &RawGomoTools,
 ) -> Result<BTreeMap<String, GomoTargetConfig>> {
     let mut targets = BTreeMap::new();
-    insert_gomo_target(&mut targets, "build", tools.build);
-    insert_gomo_target(&mut targets, "format", tools.format);
-    insert_gomo_target(&mut targets, "test", tools.test);
+    insert_gomo_target(&mut targets, "build", tools.build.clone());
+    insert_gomo_target(&mut targets, "format", tools.format.clone());
+    insert_gomo_target(&mut targets, "test", tools.test.clone());
+    insert_gomo_target(&mut targets, "watch", tools.watch.clone());
     validate_format_command_pair(path, &targets)?;
     validate_cached_folders(path, &targets)?;
     Ok(targets)
+}
+
+fn collect_gomo_dev(_path: &Path, tools: &RawGomoTools) -> Result<GomoDevConfig> {
+    let Some(config) = tools.dev.as_ref() else {
+        return Ok(GomoDevConfig::default());
+    };
+
+    let reload = config
+        .reload
+        .parse()
+        .map_err(|error: String| anyhow!("[tools.gomo.dev].{error}"))?;
+
+    Ok(GomoDevConfig {
+        command: config.command.clone(),
+        reload,
+    })
 }
 
 fn insert_gomo_target(
@@ -507,6 +575,61 @@ command = "gleam format --check"
                 .get("format")
                 .and_then(|config| config.check_command.as_deref()),
             Some("gleam format --check")
+        );
+    }
+
+    #[test]
+    fn parses_watch_and_dev_configuration() {
+        let test_workspace = TestWorkspace::new("gomo-gleam-toml-test");
+        let path = test_workspace.write_file(
+            "gleam.toml",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.watch]
+command = "./scripts/generate.sh"
+
+[tools.gomo.dev]
+command = "gleam run -m demo"
+reload = "hot"
+"#,
+        );
+
+        let manifest = parse_manifest(&path).expect("manifest should parse");
+        assert_eq!(
+            manifest
+                .gomo_targets
+                .get("watch")
+                .and_then(|config| config.command.as_deref()),
+            Some("./scripts/generate.sh")
+        );
+        assert_eq!(
+            manifest.gomo_dev.command.as_deref(),
+            Some("gleam run -m demo")
+        );
+        assert_eq!(manifest.gomo_dev.reload, GomoReloadStrategy::Hot);
+    }
+
+    #[test]
+    fn rejects_unknown_reload_strategy() {
+        let test_workspace = TestWorkspace::new("gomo-gleam-toml-test");
+        let path = test_workspace.write_file(
+            "gleam.toml",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.dev]
+reload = "maybe"
+"#,
+        );
+
+        let error = parse_manifest(&path).expect_err("unknown reload should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("reload must be `restart` or `hot`")
         );
     }
 

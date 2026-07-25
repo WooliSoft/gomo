@@ -15,6 +15,18 @@ pub(crate) fn select_affected_projects(
     target: Target,
     changed_files: &[PathBuf],
 ) -> Result<Vec<String>> {
+    select_affected_projects_within(workspace, graph, target, changed_files, None)
+}
+
+/// Select affected projects while keeping the result inside a watch session's
+/// fixed project universe.
+pub(crate) fn select_affected_projects_within(
+    workspace: &Workspace,
+    graph: &ProjectGraph,
+    target: Target,
+    changed_files: &[PathBuf],
+    permitted: Option<&BTreeSet<String>>,
+) -> Result<Vec<String>> {
     if !target.supports_cache() {
         bail!("target `{target}` does not support affected input selection");
     }
@@ -22,7 +34,11 @@ pub(crate) fn select_affected_projects(
     for changed_file in changed_files {
         validate_workspace_relative_path(changed_file)?;
         if cache::workspace_inputs_match(workspace, target, changed_file)? {
-            return Ok(target_topological_order(graph, target).to_vec());
+            return Ok(target_topological_order(graph, target)
+                .iter()
+                .filter(|project| permitted.is_none_or(|projects| projects.contains(*project)))
+                .cloned()
+                .collect());
         }
     }
 
@@ -49,7 +65,10 @@ pub(crate) fn select_affected_projects(
 
     Ok(target_topological_order(graph, target)
         .iter()
-        .filter(|project| selected.contains(*project))
+        .filter(|project| {
+            selected.contains(*project)
+                && permitted.is_none_or(|projects| projects.contains(*project))
+        })
         .cloned()
         .collect())
 }
@@ -462,6 +481,25 @@ version = "0.1.0"
         .expect("outside project file should be ignored");
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn affected_selection_can_be_limited_to_a_watch_universe() {
+        let test_workspace = TestWorkspace::new("gomo-affected-test");
+        write_graph_fixture(&test_workspace);
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let permitted = BTreeSet::from(["demo".to_string()]);
+
+        let selected = select_affected_projects_within(
+            &workspace,
+            &graph,
+            Target::Build,
+            &[PathBuf::from("libs/renderer/src/main.gleam")],
+            Some(&permitted),
+        )
+        .expect("affected projects should be selected");
+
+        assert_eq!(selected, ["demo"]);
     }
 
     #[test]

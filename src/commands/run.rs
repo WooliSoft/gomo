@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::cache;
+use crate::cancellation::CancellationToken;
 use crate::commands::{CommandOutput, OutputOptions};
 use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, CommandRunner, GleamCommandRunner, Target};
@@ -60,7 +61,7 @@ impl Default for Parallelism {
 }
 
 impl Parallelism {
-    fn resolve(self, default_parallelism: DefaultParallelism) -> usize {
+    pub(crate) fn resolve(self, default_parallelism: DefaultParallelism) -> usize {
         match self {
             Self::WorkspaceDefault => match default_parallelism {
                 DefaultParallelism::Auto => available_parallelism(),
@@ -224,13 +225,94 @@ pub(crate) fn run_project_names(
     parallelism: Parallelism,
     output_options: OutputOptions,
 ) -> Result<CommandOutput> {
+    run_project_names_with_optional_control(
+        workspace,
+        graph,
+        project_names,
+        target,
+        command_options,
+        runner,
+        cache_options,
+        parallelism,
+        output_options,
+        CancellationToken::new(),
+        None,
+    )
+}
+
+pub(crate) fn run_project_names_with_control(
+    workspace: &Workspace,
+    graph: &ProjectGraph,
+    project_names: &[String],
+    target: Target,
+    command_options: CommandOptions,
+    runner: &(impl CommandRunner + Sync),
+    cache_options: CacheOptions,
+    parallelism: Parallelism,
+    output_options: OutputOptions,
+    control: ui::run::RunManyControl,
+) -> Result<CommandOutput> {
+    run_project_names_with_optional_control(
+        workspace,
+        graph,
+        project_names,
+        target,
+        command_options,
+        runner,
+        cache_options,
+        parallelism,
+        output_options,
+        control.cancellation_token(),
+        Some(control),
+    )
+}
+
+pub(crate) fn run_project_names_with_cancellation(
+    workspace: &Workspace,
+    graph: &ProjectGraph,
+    project_names: &[String],
+    target: Target,
+    command_options: CommandOptions,
+    runner: &(impl CommandRunner + Sync),
+    cache_options: CacheOptions,
+    parallelism: Parallelism,
+    output_options: OutputOptions,
+    cancellation: CancellationToken,
+) -> Result<CommandOutput> {
+    run_project_names_with_optional_control(
+        workspace,
+        graph,
+        project_names,
+        target,
+        command_options,
+        runner,
+        cache_options,
+        parallelism,
+        output_options,
+        cancellation,
+        None,
+    )
+}
+
+fn run_project_names_with_optional_control(
+    workspace: &Workspace,
+    graph: &ProjectGraph,
+    project_names: &[String],
+    target: Target,
+    command_options: CommandOptions,
+    runner: &(impl CommandRunner + Sync),
+    cache_options: CacheOptions,
+    parallelism: Parallelism,
+    output_options: OutputOptions,
+    cancellation: CancellationToken,
+    control: Option<ui::run::RunManyControl>,
+) -> Result<CommandOutput> {
     if !cache_options.no_cache {
         cache::prepare_cache(workspace)?;
     }
 
     let project_index = project_index(workspace);
-
-    execute_tasks(
+    execute_tasks_with_hasher_and_control(
         workspace,
         graph,
         project_names,
@@ -240,11 +322,14 @@ pub(crate) fn run_project_names(
         runner,
         cache_options,
         parallelism,
+        cache::compute_task_hash,
         output_options,
+        cancellation,
+        control,
     )
 }
 
-fn selected_project_names(
+pub(crate) fn selected_project_names(
     workspace: &Workspace,
     graph: &ProjectGraph,
     request: &RunRequest,
@@ -332,33 +417,7 @@ fn project_index(workspace: &Workspace) -> BTreeMap<&str, &Project> {
         .collect()
 }
 
-fn execute_tasks(
-    workspace: &Workspace,
-    graph: &ProjectGraph,
-    project_names: &[String],
-    project_index: &BTreeMap<&str, &Project>,
-    target: Target,
-    command_options: CommandOptions,
-    runner: &(impl CommandRunner + Sync),
-    cache_options: CacheOptions,
-    parallelism: Parallelism,
-    output_options: OutputOptions,
-) -> Result<CommandOutput> {
-    execute_tasks_with_hasher(
-        workspace,
-        graph,
-        project_names,
-        project_index,
-        target,
-        command_options,
-        runner,
-        cache_options,
-        parallelism,
-        cache::compute_task_hash,
-        output_options,
-    )
-}
-
+#[cfg(test)]
 fn execute_tasks_with_hasher<R, H>(
     workspace: &Workspace,
     graph: &ProjectGraph,
@@ -371,6 +430,42 @@ fn execute_tasks_with_hasher<R, H>(
     parallelism: Parallelism,
     compute_task_hash: H,
     output_options: OutputOptions,
+) -> Result<CommandOutput>
+where
+    R: CommandRunner + Sync,
+    H: Fn(&Workspace, &ProjectGraph, &Project, Target) -> Result<cache::TaskHash> + Sync,
+{
+    execute_tasks_with_hasher_and_control(
+        workspace,
+        graph,
+        project_names,
+        project_index,
+        target,
+        command_options,
+        runner,
+        cache_options,
+        parallelism,
+        compute_task_hash,
+        output_options,
+        CancellationToken::new(),
+        None,
+    )
+}
+
+fn execute_tasks_with_hasher_and_control<R, H>(
+    workspace: &Workspace,
+    graph: &ProjectGraph,
+    project_names: &[String],
+    project_index: &BTreeMap<&str, &Project>,
+    target: Target,
+    command_options: CommandOptions,
+    runner: &R,
+    cache_options: CacheOptions,
+    parallelism: Parallelism,
+    compute_task_hash: H,
+    output_options: OutputOptions,
+    cancellation: CancellationToken,
+    control: Option<ui::run::RunManyControl>,
 ) -> Result<CommandOutput>
 where
     R: CommandRunner + Sync,
@@ -393,8 +488,17 @@ where
         output_options.tui && !output_options.ci && !output_options.json && target.supports_tui();
     let task_commands =
         task_command_displays(project_names, project_index, target, command_options)?;
+    if let Some(control) = control.as_ref() {
+        drop(control.take_idle_terminal()?);
+    }
     let mut terminal = tui_enabled.then(|| {
-        ui::run::RunManyTerminal::new(project_names, target, task_commands.clone(), max_parallel)
+        ui::run::RunManyTerminal::new_with_control(
+            project_names,
+            target,
+            task_commands.clone(),
+            max_parallel,
+            control.clone(),
+        )
     });
 
     if let Some(terminal) = terminal.as_mut() {
@@ -422,6 +526,7 @@ where
                 let started_project = project_name.clone();
                 let progress_project = project_name.clone();
                 let progress_sender = sender.clone();
+                let task_cancellation = &cancellation;
 
                 if let Some(terminal) = terminal.as_mut() {
                     if let Err(error) = terminal.task_started(&started_project) {
@@ -453,6 +558,7 @@ where
                             compute_task_hash,
                             &command_display,
                             &mut report_output,
+                            task_cancellation,
                         )
                     }))
                     .unwrap_or_else(|payload| {
@@ -612,6 +718,12 @@ where
     } else {
         None
     };
+    if terminal_exit == Some(ui::run::RunManyExit::Continued)
+        && let (Some(control), Some(mut terminal)) = (control.as_ref(), terminal.take())
+    {
+        terminal.show_waiting()?;
+        control.store_idle_terminal(terminal)?;
+    }
     let mut output = String::new();
     if output_options.json {
         output.push_str(&render_json_summary(&summary)?);
@@ -778,6 +890,7 @@ fn execute_single_task<R, H>(
     compute_task_hash: &H,
     command_display: &str,
     output_progress: &mut dyn FnMut(&str),
+    cancellation: &CancellationToken,
 ) -> Result<CompletedTask>
 where
     R: CommandRunner + Sync,
@@ -819,7 +932,13 @@ where
         None
     };
 
-    let execution = runner.run_with_output(project, target, command_options, output_progress);
+    let execution = runner.run_with_output_and_cancel(
+        project,
+        target,
+        command_options,
+        output_progress,
+        cancellation,
+    );
     append_stream(&mut output, &execution.stdout);
     append_stream(&mut output, &execution.stderr);
 

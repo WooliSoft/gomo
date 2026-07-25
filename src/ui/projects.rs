@@ -318,7 +318,7 @@ mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::{
-        gleam_toml::{DependencyTable, GleamPathDependency},
+        gleam_toml::{DependencyTable, GleamPathDependency, GomoDevConfig},
         workspace::{DefaultParallelism, DependencyVersionConfig, Project, Workspace},
     };
 
@@ -457,6 +457,7 @@ mod tests {
                 .join("gleam.toml"),
             path_dependencies,
             gomo_targets: BTreeMap::new(),
+            gomo_dev: GomoDevConfig::default(),
         }
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::gleam_toml::{GleamPathDependency, GomoTargetConfig, parse_manifest};
+use crate::gleam_toml::{GleamPathDependency, GomoDevConfig, GomoTargetConfig, parse_manifest};
 
 const CONFIG_FILE_NAME: &str = "gomo.toml";
 const DEFAULT_CACHE_DIR: &str = ".gomo/cache";
@@ -62,6 +62,8 @@ pub struct Project {
     pub path_dependencies: Vec<GleamPathDependency>,
     /// Per-target Gomo config declared by this project.
     pub gomo_targets: BTreeMap<String, GomoTargetConfig>,
+    /// Development-process configuration declared in this project's manifest.
+    pub gomo_dev: GomoDevConfig,
 }
 
 /// Workspace policy for checking resolved dependency versions across `manifest.toml` files.
@@ -477,6 +479,7 @@ fn load_project(root: &Path, project_root: PathBuf) -> Result<Project> {
         manifest_path,
         path_dependencies: manifest.path_dependencies,
         gomo_targets: manifest.gomo_targets,
+        gomo_dev: manifest.gomo_dev,
     })
 }
 

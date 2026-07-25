@@ -40,6 +40,49 @@ gomo format
 gomo format --check
 ```
 
+Watch finite work across a project and its transitive local dependencies:
+
+```sh
+gomo watch --target build --project my_app --with-deps
+gomo watch --project my_app --with-deps -- ./scripts/regenerate.sh
+```
+
+Watch performs an initial run, debounces filesystem events, serializes runs,
+and keeps waiting after a failed task or callback. Generated `build/`, `target/`,
+`node_modules/`, `.gomo/`, `.gomo-restore-*`, `.gomo-backups-*`, `.git/`, `.jj/`,
+`.devenv/`, and `.direnv/` output is ignored. Callback commands run from the
+selected project root and receive `GOMO_CHANGED_FILES`, `GOMO_CHANGED_PROJECTS`,
+`GOMO_WATCH_PROJECT`, and JSON companion variables ending in `_JSON`.
+Use `--no-initial-run` to skip the initial callback or target run.
+
+Manage a long-running development process with build-before-restart semantics:
+
+```sh
+gomo dev --project my_app
+gomo dev --project my_app -- gleam run -m my_app
+```
+
+`gomo dev` builds the project and its local dependencies before starting the
+process, runs it from the project root, and restarts it only after a successful
+rebuild. A failed rebuild leaves the current process running. Filesystem
+events and debounce timing are provided by Watchexec, and its supervisor owns
+the development process and its descendants. Development commands may be
+configured in `gleam.toml`:
+
+```toml
+[tools.gomo.watch]
+command = "./scripts/regenerate.sh"
+
+[tools.gomo.dev]
+command = "gleam run"
+reload = "restart"
+```
+
+The `hot` reload value is accepted as a forward-compatible strategy and falls
+back to a managed restart until a runtime helper is connected. Watchexec runs
+development commands in their own process group so restart and Ctrl-C clean up
+shell descendants as well.
+
 For workspace inspection and troubleshooting:
 
 ```sh
