@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::gleam_toml::{GleamPathDependency, GomoDevConfig, GomoTargetConfig, parse_manifest};
+use crate::task::{Task, TaskDefinition, TaskScope};
 
 const CONFIG_FILE_NAME: &str = "gomo.toml";
 const DEFAULT_CACHE_DIR: &str = ".gomo/cache";
@@ -39,6 +40,8 @@ pub struct Workspace {
     pub global_target_inputs: BTreeMap<String, Vec<String>>,
     /// Workspace policy for checking resolved dependency versions.
     pub dependency_versions: DependencyVersionConfig,
+    /// Workspace-scoped and reusable root task definitions.
+    pub tasks: BTreeMap<String, Task>,
     /// Gleam projects discovered under the configured roots or referenced by local path dependencies.
     pub projects: Vec<Project>,
 }
@@ -64,6 +67,9 @@ pub struct Project {
     pub gomo_targets: BTreeMap<String, GomoTargetConfig>,
     /// Development-process configuration declared in this project's manifest.
     pub gomo_dev: GomoDevConfig,
+    /// Named tasks explicitly exposed by this project.
+    pub gomo_tasks: BTreeMap<String, Task>,
+    pub(crate) gomo_task_definitions: BTreeMap<String, TaskDefinition>,
 }
 
 /// Workspace policy for checking resolved dependency versions across `manifest.toml` files.
@@ -99,6 +105,9 @@ pub fn discover(root: impl AsRef<Path>) -> Result<Workspace> {
     }
 
     reject_duplicate_names(&projects)?;
+    let tasks = resolve_root_tasks(config.tasks)?;
+    resolve_project_tasks(&tasks, &mut projects)?;
+    validate_task_references(&tasks, &projects)?;
 
     Ok(Workspace {
         root,
@@ -109,8 +118,324 @@ pub fn discover(root: impl AsRef<Path>) -> Result<Workspace> {
         default_parallelism: config.default_parallelism,
         global_target_inputs: config.global_target_inputs,
         dependency_versions: config.dependency_versions,
+        tasks,
         projects,
     })
+}
+
+fn resolve_root_tasks(
+    definitions: BTreeMap<String, TaskDefinition>,
+) -> Result<BTreeMap<String, Task>> {
+    let mut tasks = BTreeMap::new();
+    for (name, definition) in definitions {
+        if definition.extends.is_some() {
+            bail!("root task `{name}` cannot use `extends`");
+        }
+        let task = definition.resolve(&name, TaskScope::Workspace, None)?;
+        tasks.insert(name, task);
+    }
+    Ok(tasks)
+}
+
+fn resolve_project_tasks(
+    root_tasks: &BTreeMap<String, Task>,
+    projects: &mut [Project],
+) -> Result<()> {
+    for project in projects {
+        let definitions = std::mem::take(&mut project.gomo_task_definitions);
+        let mut exposed = BTreeMap::new();
+
+        for (name, definition) in definitions {
+            let base = if let Some(extends) = definition.extends.as_deref() {
+                let task = root_tasks.get(extends).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "project `{}` task `{name}` extends unknown root task `{extends}`",
+                        project.name
+                    )
+                })?;
+                if task.scope != TaskScope::Project {
+                    bail!(
+                        "project `{}` task `{name}` cannot extend workspace task `{extends}`",
+                        project.name
+                    );
+                }
+                Some(task)
+            } else {
+                if root_tasks.contains_key(&name) {
+                    bail!(
+                        "project `{}` task `{name}` collides with a root task; add extends = \"{name}\" to expose it explicitly",
+                        project.name
+                    );
+                }
+                None
+            };
+            let task = definition.resolve(&name, TaskScope::Project, base)?;
+            if task.scope != TaskScope::Project {
+                bail!(
+                    "project `{}` task `{name}` must have project scope",
+                    project.name
+                );
+            }
+            exposed.insert(name, task);
+        }
+
+        for (target, config) in &project.gomo_targets {
+            let Some(task_name) = config.task.as_deref() else {
+                continue;
+            };
+            if exposed.contains_key(task_name) {
+                continue;
+            }
+            let root_task = root_tasks.get(task_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "project `{}` binds target `{target}` to unknown task `{task_name}`",
+                    project.name
+                )
+            })?;
+            if root_task.scope != TaskScope::Project {
+                bail!(
+                    "project `{}` binds target `{target}` to workspace task `{task_name}`; target bindings require project tasks",
+                    project.name
+                );
+            }
+            exposed.insert(task_name.to_string(), root_task.clone());
+        }
+        project.gomo_tasks = exposed;
+    }
+    Ok(())
+}
+
+fn validate_task_references(
+    root_tasks: &BTreeMap<String, Task>,
+    projects: &[Project],
+) -> Result<()> {
+    for task in root_tasks
+        .values()
+        .filter(|task| task.scope == TaskScope::Workspace)
+    {
+        for dependency in &task.depends_on {
+            let referenced = root_tasks.get(dependency).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task `{}` depends on unknown task `{dependency}`",
+                    task.name
+                )
+            })?;
+            if referenced.scope != TaskScope::Workspace {
+                bail!(
+                    "workspace task `{}` cannot depend directly on project task `{dependency}`",
+                    task.name
+                );
+            }
+            if referenced.persistent {
+                bail!(
+                    "task `{}` cannot use persistent task `{dependency}` as a prerequisite",
+                    task.name
+                );
+            }
+        }
+        validate_step_references(task, None, root_tasks, projects)?;
+    }
+
+    for project in projects {
+        for task in project.gomo_tasks.values() {
+            for dependency in &task.depends_on {
+                let referenced = project.gomo_tasks.get(dependency).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "project `{}` task `{}` depends on task `{dependency}`, which that project does not expose",
+                        project.name,
+                        task.name
+                    )
+                })?;
+                if referenced.persistent {
+                    bail!(
+                        "project `{}` task `{}` cannot use persistent task `{dependency}` as a prerequisite",
+                        project.name,
+                        task.name
+                    );
+                }
+            }
+            validate_step_references(task, Some(project), root_tasks, projects)?;
+        }
+    }
+    reject_task_cycles(root_tasks, projects)?;
+    Ok(())
+}
+
+fn validate_step_references(
+    task: &Task,
+    owner_project: Option<&Project>,
+    root_tasks: &BTreeMap<String, Task>,
+    projects: &[Project],
+) -> Result<()> {
+    for step in &task.steps {
+        if let Some(action) = &step.task {
+            if let Some(project_name) = action.project.as_deref() {
+                let project = projects
+                    .iter()
+                    .find(|project| project.name == project_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "task `{}` references unknown project `{project_name}`",
+                            task.name
+                        )
+                    })?;
+                if !project.gomo_tasks.contains_key(&action.name) {
+                    bail!(
+                        "task `{}` invokes `{project_name}:{}`, but that project does not expose the task",
+                        task.name,
+                        action.name
+                    );
+                }
+            } else if let Some(project) = owner_project {
+                if !project.gomo_tasks.contains_key(&action.name) {
+                    bail!(
+                        "project `{}` task `{}` invokes task `{}`, which that project does not expose",
+                        project.name,
+                        task.name,
+                        action.name
+                    );
+                }
+            } else if !root_tasks
+                .get(&action.name)
+                .is_some_and(|referenced| referenced.scope == TaskScope::Workspace)
+            {
+                bail!(
+                    "workspace task `{}` invokes unknown workspace task `{}`",
+                    task.name,
+                    action.name
+                );
+            }
+        }
+        let referenced_projects = step
+            .target
+            .as_ref()
+            .and_then(|action| action.project.as_deref())
+            .into_iter()
+            .chain(step.dev.as_ref().map(|action| action.project.as_str()))
+            .chain(
+                step.watch
+                    .as_ref()
+                    .and_then(|action| action.project.as_deref()),
+            )
+            .chain(step.module.as_ref().map(|action| action.project.as_str()));
+        for project_name in referenced_projects {
+            if !projects.iter().any(|project| project.name == project_name) {
+                bail!(
+                    "task `{}` references unknown project `{project_name}`",
+                    task.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TaskNode {
+    project: Option<String>,
+    task: String,
+}
+
+impl TaskNode {
+    fn workspace(task: impl Into<String>) -> Self {
+        Self {
+            project: None,
+            task: task.into(),
+        }
+    }
+
+    fn project(project: impl Into<String>, task: impl Into<String>) -> Self {
+        Self {
+            project: Some(project.into()),
+            task: task.into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match &self.project {
+            Some(project) => format!("{project}:{}", self.task),
+            None => self.task.clone(),
+        }
+    }
+}
+
+fn reject_task_cycles(root_tasks: &BTreeMap<String, Task>, projects: &[Project]) -> Result<()> {
+    let mut edges: BTreeMap<TaskNode, Vec<TaskNode>> = BTreeMap::new();
+
+    for task in root_tasks
+        .values()
+        .filter(|task| task.scope == TaskScope::Workspace)
+    {
+        let node = TaskNode::workspace(&task.name);
+        edges.insert(node.clone(), task_reference_nodes(task, None));
+    }
+
+    for project in projects {
+        for task in project.gomo_tasks.values() {
+            let node = TaskNode::project(&project.name, &task.name);
+            edges.insert(
+                node.clone(),
+                task_reference_nodes(task, Some(&project.name)),
+            );
+        }
+    }
+
+    fn visit(
+        node: &TaskNode,
+        edges: &BTreeMap<TaskNode, Vec<TaskNode>>,
+        visiting: &mut Vec<TaskNode>,
+        visited: &mut BTreeSet<TaskNode>,
+    ) -> Result<()> {
+        if let Some(index) = visiting.iter().position(|candidate| candidate == node) {
+            let mut cycle = visiting[index..]
+                .iter()
+                .map(TaskNode::display)
+                .collect::<Vec<_>>();
+            cycle.push(node.display());
+            bail!("task cycle: {}", cycle.join(" -> "));
+        }
+        if visited.contains(node) {
+            return Ok(());
+        }
+        visiting.push(node.clone());
+        if let Some(dependencies) = edges.get(node) {
+            for dependency in dependencies {
+                if edges.contains_key(dependency) {
+                    visit(dependency, edges, visiting, visited)?;
+                }
+            }
+        }
+        visiting.pop();
+        visited.insert(node.clone());
+        Ok(())
+    }
+
+    let mut visited = BTreeSet::new();
+    for node in edges.keys() {
+        visit(node, &edges, &mut Vec::new(), &mut visited)?;
+    }
+    Ok(())
+}
+
+fn task_reference_nodes(task: &Task, owner_project: Option<&str>) -> Vec<TaskNode> {
+    let mut nodes = Vec::new();
+    for dependency in &task.depends_on {
+        nodes.push(match owner_project {
+            Some(project) => TaskNode::project(project, dependency),
+            None => TaskNode::workspace(dependency),
+        });
+    }
+    for step in &task.steps {
+        let Some(action) = &step.task else {
+            continue;
+        };
+        let project = action.project.as_deref().or(owner_project);
+        nodes.push(match project {
+            Some(project) => TaskNode::project(project, &action.name),
+            None => TaskNode::workspace(&action.name),
+        });
+    }
+    nodes
 }
 
 fn find_workspace_root(start: &Path) -> Result<PathBuf> {
@@ -146,6 +471,8 @@ struct RawGomoConfig {
     cache: RawCacheConfig,
     #[serde(default)]
     dependency_versions: Option<RawDependencyVersionConfig>,
+    #[serde(default)]
+    tasks: BTreeMap<String, TaskDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +533,7 @@ struct WorkspaceConfig {
     default_parallelism: DefaultParallelism,
     global_target_inputs: BTreeMap<String, Vec<String>>,
     dependency_versions: DependencyVersionConfig,
+    tasks: BTreeMap<String, TaskDefinition>,
 }
 
 fn parse_workspace_config(root: &Path) -> Result<WorkspaceConfig> {
@@ -261,6 +589,7 @@ fn parse_workspace_config(root: &Path) -> Result<WorkspaceConfig> {
         default_parallelism,
         global_target_inputs: collect_workspace_target_inputs(build, format, test),
         dependency_versions: normalize_dependency_version_config(raw_config.dependency_versions)?,
+        tasks: raw_config.tasks,
     })
 }
 
@@ -480,6 +809,8 @@ fn load_project(root: &Path, project_root: PathBuf) -> Result<Project> {
         path_dependencies: manifest.path_dependencies,
         gomo_targets: manifest.gomo_targets,
         gomo_dev: manifest.gomo_dev,
+        gomo_tasks: BTreeMap::new(),
+        gomo_task_definitions: manifest.gomo_tasks,
     })
 }
 
@@ -948,5 +1279,48 @@ version = "0.1.0"
                 .to_string()
                 .contains("duplicate Gleam package name `duplicate`")
         );
+    }
+
+    #[test]
+    fn rejects_cross_project_task_cycles() {
+        let test_workspace = TestWorkspace::new("gomo-task-cycle");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.ping]
+scope = "project"
+steps = [{ task = { name = "pong", project = "two" } }]
+
+[tasks.pong]
+scope = "project"
+steps = [{ task = { name = "ping", project = "one" } }]
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/one",
+            r#"
+name = "one"
+version = "0.1.0"
+
+[tools.gomo.tasks.ping]
+extends = "ping"
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/two",
+            r#"
+name = "two"
+version = "0.1.0"
+
+[tools.gomo.tasks.pong]
+extends = "pong"
+"#,
+        );
+
+        let error = discover(test_workspace.path()).expect_err("cross-project cycles should fail");
+        assert!(error.to_string().contains("task cycle:"));
     }
 }

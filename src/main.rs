@@ -9,6 +9,7 @@ mod gleam_lock;
 mod gleam_toml;
 mod graph;
 mod runner;
+mod task;
 #[cfg(test)]
 mod test_support;
 mod ui;

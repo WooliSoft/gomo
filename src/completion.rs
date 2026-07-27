@@ -25,6 +25,42 @@ pub(crate) fn project_candidates() -> Vec<CompletionCandidate> {
         .collect()
 }
 
+pub(crate) fn task_candidates() -> Vec<CompletionCandidate> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(workspace) = workspace::discover_from(&cwd) else {
+        return Vec::new();
+    };
+    let mut names = workspace.tasks.keys().cloned().collect::<Vec<_>>();
+    names.extend(
+        workspace
+            .projects
+            .iter()
+            .flat_map(|project| project.gomo_tasks.keys().cloned()),
+    );
+    names.sort();
+    names.dedup();
+    names.into_iter().map(CompletionCandidate::new).collect()
+}
+
+pub(crate) fn project_task_candidates() -> Vec<CompletionCandidate> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(workspace) = workspace::discover_from(&cwd) else {
+        return Vec::new();
+    };
+    let mut names = workspace
+        .projects
+        .iter()
+        .flat_map(|project| project.gomo_tasks.keys().cloned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.into_iter().map(CompletionCandidate::new).collect()
+}
+
 pub(crate) fn generate_registration(shell: Shell) -> Result<CommandOutput> {
     let shells = Shells::builtins();
     let shell = shells

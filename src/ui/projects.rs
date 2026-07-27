@@ -424,6 +424,7 @@ mod tests {
                 include_local: true,
                 ignore: Vec::new(),
             },
+            tasks: BTreeMap::new(),
             projects: vec![
                 project(
                     "demo",
@@ -458,6 +459,8 @@ mod tests {
             path_dependencies,
             gomo_targets: BTreeMap::new(),
             gomo_dev: GomoDevConfig::default(),
+            gomo_tasks: BTreeMap::new(),
+            gomo_task_definitions: BTreeMap::new(),
         }
     }
 }

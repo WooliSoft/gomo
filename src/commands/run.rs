@@ -201,6 +201,90 @@ fn run_with_runner_and_cache(
     let graph = ProjectGraph::build(&workspace)?;
     let project_names = selected_project_names(&workspace, &graph, &request)?;
 
+    if project_names.iter().any(|name| {
+        workspace
+            .projects
+            .iter()
+            .find(|project| project.name == *name)
+            .and_then(|project| project.gomo_targets.get(request.target.as_str()))
+            .and_then(|config| config.task.as_ref())
+            .is_some()
+    }) {
+        let mut output = String::new();
+        let mut native_projects = Vec::new();
+        let flush_native = |projects: &mut Vec<String>, output: &mut String| -> Result<()> {
+            if projects.is_empty() {
+                return Ok(());
+            }
+            output.push_str(
+                &run_project_names(
+                    &workspace,
+                    &graph,
+                    projects,
+                    request.target,
+                    request.command_options,
+                    runner,
+                    cache_options,
+                    request.parallelism,
+                    output_options,
+                )?
+                .stdout,
+            );
+            projects.clear();
+            Ok(())
+        };
+
+        for project_name in &project_names {
+            let project = workspace
+                .projects
+                .iter()
+                .find(|project| project.name == *project_name)
+                .with_context(|| format!("unknown project `{project_name}`"))?;
+            if let Some(task_name) = project
+                .gomo_targets
+                .get(request.target.as_str())
+                .and_then(|config| config.task.as_ref())
+            {
+                flush_native(&mut native_projects, &mut output)?;
+                let target_key = (project_name.clone(), request.target.as_str().to_string());
+                if super::task::target_task_stack_contains(&target_key) {
+                    bail!(
+                        "target `{}` on project `{project_name}` is bound to task `{task_name}`, which re-enters the same target",
+                        request.target.as_str()
+                    );
+                }
+                super::task::push_target_task_stack(target_key.clone());
+                let task_result = (|| {
+                    super::task::run(
+                        cwd,
+                        super::task::TaskRunRequest {
+                            name: task_name.clone(),
+                            project: Some(project_name.clone()),
+                            parallelism: request.parallelism,
+                        },
+                        cache_options,
+                        output_options,
+                    )
+                })();
+                super::task::pop_target_task_stack();
+                output.push_str(
+                    &task_result
+                        .with_context(|| {
+                            format!(
+                                "task `{task_name}` bound to target `{}` on project `{project_name}` failed",
+                                request.target.as_str()
+                            )
+                        })?
+                        .stdout,
+                );
+            } else {
+                native_projects.push(project_name.clone());
+            }
+        }
+        flush_native(&mut native_projects, &mut output)?;
+        return Ok(CommandOutput::success(output));
+    }
+
     run_project_names(
         &workspace,
         &graph,

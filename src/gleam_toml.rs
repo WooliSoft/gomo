@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::task::TaskDefinition;
+
 /// Parsed Gomo-relevant data from a package `gleam.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GleamManifest {
@@ -21,6 +23,8 @@ pub struct GleamManifest {
     pub gomo_targets: BTreeMap<String, GomoTargetConfig>,
     /// Development-process config declared under `[tools.gomo.dev]`.
     pub gomo_dev: GomoDevConfig,
+    /// Named tasks declared under `[tools.gomo.tasks.<name>]`.
+    pub gomo_tasks: BTreeMap<String, TaskDefinition>,
 }
 
 /// Gomo target config parsed from a package `gleam.toml`.
@@ -34,6 +38,8 @@ pub struct GomoTargetConfig {
     pub check_command: Option<String>,
     /// Optional build output directories to store and restore from cache.
     pub cached_folders: Option<Vec<String>>,
+    /// Named task bound to this native target.
+    pub task: Option<String>,
 }
 
 /// Development-process configuration declared under `[tools.gomo.dev]`.
@@ -119,6 +125,8 @@ struct RawGomoTools {
     watch: Option<RawGomoTarget>,
     #[serde(default)]
     dev: Option<RawGomoDevConfig>,
+    #[serde(default)]
+    tasks: BTreeMap<String, TaskDefinition>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -139,6 +147,7 @@ struct RawGomoTarget {
     command: Option<String>,
     check: Option<RawGomoTargetCheck>,
     cached_folders: Option<Vec<String>>,
+    task: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -214,6 +223,7 @@ pub fn parse_manifest(path: &Path) -> Result<GleamManifest> {
         path_dependencies,
         gomo_targets: collect_gomo_targets(path, &gomo)?,
         gomo_dev: collect_gomo_dev(path, &gomo)?,
+        gomo_tasks: gomo.tasks,
     })
 }
 
@@ -234,8 +244,38 @@ fn collect_gomo_targets(
     insert_gomo_target(&mut targets, "test", tools.test.clone());
     insert_gomo_target(&mut targets, "watch", tools.watch.clone());
     validate_format_command_pair(path, &targets)?;
+    validate_target_task_bindings(path, &targets)?;
     validate_cached_folders(path, &targets)?;
     Ok(targets)
+}
+
+fn validate_target_task_bindings(
+    path: &Path,
+    targets: &BTreeMap<String, GomoTargetConfig>,
+) -> Result<()> {
+    for (target, config) in targets {
+        if config.task.is_some() && (config.command.is_some() || config.check_command.is_some()) {
+            bail!(
+                "{} defines [tools.gomo.{target}].task together with a command; `task` and `command` are mutually exclusive",
+                path.display()
+            );
+        }
+        if config.task.is_some() && config.cached_folders.is_some() {
+            bail!(
+                "{} defines [tools.gomo.{target}].task together with cached_folders; task output caching replaces cached_folders",
+                path.display()
+            );
+        }
+        if let Some(task) = &config.task {
+            crate::task::validate_name(task).map_err(|error| {
+                anyhow!(
+                    "{} has invalid [tools.gomo.{target}].task: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_gomo_dev(_path: &Path, tools: &RawGomoTools) -> Result<GomoDevConfig> {
@@ -267,6 +307,7 @@ fn insert_gomo_target(
                 command: config.command,
                 check_command: config.check.and_then(|check| check.command),
                 cached_folders: config.cached_folders,
+                task: config.task,
             },
         );
     }

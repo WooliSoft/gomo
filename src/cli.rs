@@ -86,6 +86,11 @@ enum Commands {
         #[command(flatten)]
         selection: ProjectSelectionArgs,
     },
+    /// List and run named workflow tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommands,
+    },
     /// Validate the current workspace and dependency graph.
     Doctor,
     /// Inspect resolved dependency versions from Gleam manifest.toml files.
@@ -97,13 +102,23 @@ enum Commands {
     Explain {
         /// Built-in target to explain.
         #[arg(long, value_enum)]
-        target: Target,
-        /// Project name to explain.
+        target: Option<Target>,
+        /// Named task to explain.
+        #[arg(long, add = ArgValueCandidates::new(completion::task_candidates))]
+        task: Option<String>,
+        /// Project name to explain or project exposing the named task.
         #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
-        project: String,
+        project: Option<String>,
     },
     /// Inspect the workspace dependency graph.
-    Graph,
+    Graph {
+        /// Show the reachable graph for a named task.
+        #[arg(long, add = ArgValueCandidates::new(completion::task_candidates))]
+        task: Option<String>,
+        /// Project exposing the named task.
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
+        project: Option<String>,
+    },
     /// Create a full-stack Lustre monorepo.
     Init {
         /// Directory to initialize.
@@ -207,6 +222,37 @@ enum Commands {
 enum DepsCommands {
     /// Check resolved dependency versions across project manifest.toml files.
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommands {
+    /// List named tasks.
+    List {
+        /// Show tasks explicitly exposed by one project.
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
+        project: Option<String>,
+    },
+    /// Run one workspace or project task.
+    Run {
+        /// Task name to run.
+        #[arg(add = ArgValueCandidates::new(completion::task_candidates))]
+        name: String,
+        /// Project exposing the task. Required for project tasks.
+        #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
+        project: Option<String>,
+    },
+    /// Run a project task for multiple projects.
+    RunMany {
+        /// Project task name to run.
+        #[arg(add = ArgValueCandidates::new(completion::project_task_candidates))]
+        name: String,
+        /// Run every project that explicitly exposes this task.
+        #[arg(long)]
+        all: bool,
+        /// Run a comma-separated or repeated project list.
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        projects: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -338,11 +384,25 @@ fn execute_from_with_terminal(
         Some(Commands::Deps {
             command: DepsCommands::Check,
         }) => commands::deps::run(cwd, output_options),
-        Some(Commands::Explain { target, project }) => commands::explain::run(
-            cwd,
-            commands::explain::ExplainRequest { target, project },
-            output_options,
-        ),
+        Some(Commands::Explain {
+            target,
+            task,
+            project,
+        }) => match (target, task) {
+            (Some(target), None) => commands::explain::run(
+                cwd,
+                commands::explain::ExplainRequest {
+                    target,
+                    project: project
+                        .ok_or_else(|| anyhow::anyhow!("explain --target requires --project"))?,
+                },
+                output_options,
+            ),
+            (None, Some(task)) => {
+                commands::task::explain(cwd, &task, project.as_deref(), output_options)
+            }
+            _ => bail!("explain requires exactly one of --target or --task"),
+        },
         Some(Commands::Test { selection }) => run_shorthand(
             cwd,
             Target::Test,
@@ -352,7 +412,53 @@ fn execute_from_with_terminal(
             parallelism,
             output_options,
         ),
-        Some(Commands::Graph) => commands::graph::run(cwd, output_options),
+        Some(Commands::Task {
+            command: TaskCommands::List { project },
+        }) => commands::task::list(cwd, project.as_deref(), output_options),
+        Some(Commands::Task {
+            command: TaskCommands::Run { name, project },
+        }) => commands::task::run(
+            cwd,
+            commands::task::TaskRunRequest {
+                name,
+                project,
+                parallelism,
+            },
+            cache_options,
+            output_options,
+        ),
+        Some(Commands::Task {
+            command:
+                TaskCommands::RunMany {
+                    name,
+                    all,
+                    projects,
+                },
+        }) => {
+            if all == !projects.is_empty() {
+                bail!("task run-many requires exactly one of --all or --projects");
+            }
+            commands::task::run_many(
+                cwd,
+                commands::task::TaskRunManyRequest {
+                    name,
+                    all,
+                    projects,
+                    parallelism,
+                },
+                cache_options,
+                output_options,
+            )
+        }
+        Some(Commands::Graph { task, project }) => {
+            if let Some(task) = task {
+                commands::task::graph(cwd, &task, project.as_deref(), output_options)
+            } else if project.is_some() {
+                bail!("graph --project requires --task")
+            } else {
+                commands::graph::run(cwd, output_options)
+            }
+        }
         Some(Commands::Init { path }) => {
             commands::init::run(cwd, commands::init::InitRequest { path }, output_options)
         }
@@ -1053,9 +1159,14 @@ version = "0.1.0"
                 .expect("explain args should parse");
 
         match cli.command {
-            Some(Commands::Explain { target, project }) => {
-                assert_eq!(target, Target::Test);
-                assert_eq!(project, "shared");
+            Some(Commands::Explain {
+                target,
+                task,
+                project,
+            }) => {
+                assert_eq!(target, Some(Target::Test));
+                assert_eq!(task, None);
+                assert_eq!(project, Some("shared".to_string()));
             }
             other => panic!("expected explain command, got {other:?}"),
         }

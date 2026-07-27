@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v4";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = "v5";
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -27,6 +27,7 @@ const DEFAULT_BUILD_INPUTS: &[&str] = &[
     "gleam.toml",
     "manifest.toml",
     "src/**",
+    "dev/**",
     "package.json",
     "bun.lock",
     "vite.config.*",
@@ -37,6 +38,7 @@ const DEFAULT_TEST_INPUTS: &[&str] = &[
     "gleam.toml",
     "manifest.toml",
     "src/**",
+    "dev/**",
     "test/**",
     "package.json",
     "bun.lock",
@@ -44,7 +46,8 @@ const DEFAULT_TEST_INPUTS: &[&str] = &[
     "tsconfig*.json",
     "index.html",
 ];
-const DEFAULT_FORMAT_INPUTS: &[&str] = &["gleam.toml", "manifest.toml", "src/**", "test/**"];
+const DEFAULT_FORMAT_INPUTS: &[&str] =
+    &["gleam.toml", "manifest.toml", "src/**", "dev/**", "test/**"];
 const ENV_ALLOWLIST: &[&str] = &["GLEAM_ENV", "GLEAM_TARGET"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

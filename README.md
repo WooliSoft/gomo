@@ -40,6 +40,52 @@ gomo format
 gomo format --check
 ```
 
+Named workflow tasks compose native Gomo operations, project-backed modules,
+structured external commands, shell pipelines, and other tasks:
+
+```sh
+gomo task list
+gomo task list --project web_app
+gomo task run release
+gomo task run vite-build --project web_app
+gomo task run-many lint --all
+```
+
+Workspace tasks are declared under `[tasks.<name>]` in `gomo.toml`. Reusable
+project tasks set `scope = "project"` and are exposed explicitly by a package:
+
+```toml
+# gomo.toml
+[tasks.vite-build]
+scope = "project"
+description = "Build the Vite-backed application"
+cache = true
+steps = [
+  { shell = { command = "vite build", cwd = "{project_root}" } },
+]
+
+[tasks.release]
+depends_on = ["validate"]
+steps = [
+  { task = { name = "vite-build", project = "web_app" } },
+  { exec = { program = "docker", args = ["compose", "build"] } },
+]
+
+# apps/web_app/gleam.toml
+[tools.gomo.tasks.vite-build]
+extends = "vite-build"
+
+[tools.gomo.build]
+task = "vite-build"
+```
+
+Task definitions support sequential or parallel steps, explicit prerequisites,
+workspace/project scope, descriptions, persistent workflows, declared inputs
+and outputs, and opt-in cache metadata. Each step has exactly one `task`,
+`target`, `dev`, `watch`, `module`, `exec`, or `shell` action. Direct project
+task invocation always requires `--project`; the current directory never
+selects a project implicitly.
+
 Watch finite work across a project and its transitive local dependencies:
 
 ```sh
@@ -159,8 +205,7 @@ inputs = ["gleam.toml", "src/**", "test/**", "fixtures/**"]
 command = "gleam test --target erlang"
 
 [tools.gomo.build]
-command = "sh ../../scripts/build_vite_app.sh ."
-cached_folders = ["build", "dist"]
+task = "vite-build"
 
 [tools.gomo.format]
 command = "mise exec -- gleam format"
