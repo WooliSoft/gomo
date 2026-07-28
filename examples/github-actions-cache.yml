@@ -1,0 +1,29 @@
+name: Gomo cache example
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Gomo cache
+        id: gomo-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .gomo/cache
+          key: gomo-v6-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gomo-v6-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      # Requires `gomo` on PATH (install via your Nix/devenv setup or cargo install).
+      - run: gomo test
+
+      - name: Save Gomo cache
+        if: ${{ success() && github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v5
+        with:
+          path: .gomo/cache
+          key: ${{ steps.gomo-cache.outputs.cache-primary-key }}

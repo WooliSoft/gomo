@@ -751,7 +751,10 @@ fn filter_log_metadata(input: &str) -> String {
 }
 
 fn is_hidden_log_metadata(line: &str) -> bool {
-    line.trim_start().starts_with("[cache hit]")
+    let trimmed = line.trim_start();
+    trimmed.starts_with("[cache hit]")
+        || trimmed.starts_with("[cache hit local]")
+        || trimmed.starts_with("[cache hit remote")
 }
 
 fn is_hidden_cached_output_line(line: &str, command_display: &str) -> bool {
@@ -1194,7 +1197,7 @@ mod tests {
     #[test]
     fn hides_cache_hit_metadata_from_logs() {
         assert_eq!(
-            filter_log_metadata("[cache hit] abc123\nreal output\n"),
+            filter_log_metadata("[cache hit local] abc123\nreal output\n"),
             "real output"
         );
     }
@@ -1203,7 +1206,7 @@ mod tests {
     fn cached_log_output_keeps_only_replayed_command_output() {
         assert_eq!(
             cached_log_output(
-                "==> web_app:build (apps/web_app)\n$ gleam build\n[cache hit] abc123\ncompiled\n",
+                "==> web_app:build (apps/web_app)\n$ gleam build\n[cache hit local] abc123\ncompiled\n",
                 "gleam build",
             ),
             "compiled"
@@ -1225,6 +1228,11 @@ mod tests {
                 project: "web_app".to_string(),
                 status: TaskStatus::Failed(1),
                 cache_status: Some(TaskCacheStatus::Miss),
+                cache_source: None,
+                remote_scope: None,
+                bytes_downloaded: 0,
+                bytes_uploaded: 0,
+                upload_result: None,
             }],
         };
         let rendered = render_terminal_summary(&summary);

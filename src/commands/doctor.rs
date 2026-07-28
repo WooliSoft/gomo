@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::commands::{CommandOutput, OutputOptions};
 use crate::dependency_versions;
 use crate::graph::ProjectGraph;
+use crate::remote_cache::RemoteCacheClient;
 use crate::workspace::{self, Workspace};
 
 const DEFAULT_RICH_WIDTH: usize = 100;
@@ -77,11 +78,45 @@ fn diagnose(cwd: &Path) -> DoctorReport {
 
     check_projects(&mut report, &workspace);
     check_cache_dir(&mut report, &workspace);
+    check_remote_cache(&mut report, &workspace);
     check_graph(&mut report, &workspace);
     check_dependency_versions(&mut report, &workspace);
     report.finish();
 
     report
+}
+
+fn check_remote_cache(report: &mut DoctorReport, workspace: &Workspace) {
+    let Some(config) = &workspace.remote_cache else {
+        report.ok(
+            "remote cache",
+            "not configured; Gomo will use local cache only",
+        );
+        return;
+    };
+    match RemoteCacheClient::from_workspace(workspace)
+        .and_then(|client| client.context("remote cache client was not configured"))
+        .and_then(|client| client.capabilities())
+    {
+        Ok(capabilities) => report.ok(
+            "remote cache",
+            format!(
+                "connected to {} for workspace `{}`; capabilities: {}",
+                config.url,
+                config.workspace,
+                capabilities.capabilities.join(", ")
+            ),
+        ),
+        Err(error) => match config.failure {
+            crate::workspace::RemoteFailureMode::Warn => report.warning(
+                "remote cache",
+                format!("{error}; task commands will warn and continue locally"),
+            ),
+            crate::workspace::RemoteFailureMode::Error => {
+                report.error("remote cache", error.to_string())
+            }
+        },
+    }
 }
 
 fn check_dependency_versions(report: &mut DoctorReport, workspace: &Workspace) {

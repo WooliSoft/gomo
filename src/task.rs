@@ -2,7 +2,72 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 use anyhow::{Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TaskInput {
+    Glob(String),
+    Detailed {
+        glob: String,
+        #[serde(default)]
+        optional: bool,
+    },
+}
+
+impl TaskInput {
+    pub fn glob(&self) -> &str {
+        match self {
+            Self::Glob(glob) | Self::Detailed { glob, .. } => glob,
+        }
+    }
+
+    pub fn optional(&self) -> bool {
+        matches!(self, Self::Detailed { optional: true, .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyCacheStrategy {
+    #[default]
+    Hash,
+    Outputs,
+    Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TaskDependency {
+    Name(String),
+    Detailed {
+        task: String,
+        #[serde(default)]
+        cache_strategy: DependencyCacheStrategy,
+    },
+}
+
+impl TaskDependency {
+    fn into_parts(self) -> (String, DependencyCacheStrategy) {
+        match self {
+            Self::Name(task) => (task, DependencyCacheStrategy::Hash),
+            Self::Detailed {
+                task,
+                cache_strategy,
+            } => (task, cache_strategy),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainProbe {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub optional: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,13 +90,16 @@ pub struct Task {
     pub scope: TaskScope,
     pub description: Option<String>,
     pub depends_on: Vec<String>,
+    pub dependency_cache_strategies: BTreeMap<String, DependencyCacheStrategy>,
     pub mode: TaskMode,
     pub steps: Vec<TaskStep>,
     pub persistent: bool,
     pub cache: bool,
-    pub inputs: Vec<String>,
+    pub remote_cache: bool,
+    pub inputs: Vec<TaskInput>,
     pub outputs: Vec<String>,
     pub env_inputs: Vec<String>,
+    pub tools: Vec<ToolchainProbe>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -40,14 +108,16 @@ pub struct TaskDefinition {
     pub extends: Option<String>,
     pub scope: Option<TaskScope>,
     pub description: Option<String>,
-    pub depends_on: Option<Vec<String>>,
+    pub depends_on: Option<Vec<TaskDependency>>,
     pub mode: Option<TaskMode>,
     pub steps: Option<Vec<TaskStep>>,
     pub persistent: Option<bool>,
     pub cache: Option<bool>,
-    pub inputs: Option<Vec<String>>,
+    pub remote_cache: Option<bool>,
+    pub inputs: Option<Vec<TaskInput>>,
     pub outputs: Option<Vec<String>>,
     pub env_inputs: Option<Vec<String>>,
+    pub tools: Option<Vec<ToolchainProbe>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -172,6 +242,33 @@ impl TaskDefinition {
         default_scope: TaskScope,
         base: Option<&Task>,
     ) -> Result<Task> {
+        let dependency_specs = self.depends_on.clone().or_else(|| {
+            base.map(|task| {
+                task.depends_on
+                    .iter()
+                    .map(|name| TaskDependency::Detailed {
+                        task: name.clone(),
+                        cache_strategy: task
+                            .dependency_cache_strategies
+                            .get(name)
+                            .copied()
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+        });
+        let (depends_on, dependency_cache_strategies) = dependency_specs
+            .unwrap_or_default()
+            .into_iter()
+            .map(TaskDependency::into_parts)
+            .fold(
+                (Vec::new(), BTreeMap::new()),
+                |(mut names, mut strategies), (name, strategy)| {
+                    names.push(name.clone());
+                    strategies.insert(name, strategy);
+                    (names, strategies)
+                },
+            );
         let task = Task {
             name: name.to_string(),
             scope: self
@@ -182,11 +279,8 @@ impl TaskDefinition {
                 .description
                 .clone()
                 .or_else(|| base.and_then(|task| task.description.clone())),
-            depends_on: self
-                .depends_on
-                .clone()
-                .or_else(|| base.map(|task| task.depends_on.clone()))
-                .unwrap_or_default(),
+            depends_on,
+            dependency_cache_strategies,
             mode: self
                 .mode
                 .or_else(|| base.map(|task| task.mode))
@@ -204,6 +298,10 @@ impl TaskDefinition {
                 .cache
                 .or_else(|| base.map(|task| task.cache))
                 .unwrap_or(false),
+            remote_cache: self
+                .remote_cache
+                .or_else(|| base.map(|task| task.remote_cache))
+                .unwrap_or(true),
             inputs: self
                 .inputs
                 .clone()
@@ -218,6 +316,11 @@ impl TaskDefinition {
                 .env_inputs
                 .clone()
                 .or_else(|| base.map(|task| task.env_inputs.clone()))
+                .unwrap_or_default(),
+            tools: self
+                .tools
+                .clone()
+                .or_else(|| base.map(|task| task.tools.clone()))
                 .unwrap_or_default(),
         };
         task.validate()?;
@@ -265,7 +368,10 @@ impl Task {
                 }
             }
         }
-        for path in self.inputs.iter().chain(&self.outputs) {
+        for input in &self.inputs {
+            validate_declared_path(&self.name, input.glob())?;
+        }
+        for path in &self.outputs {
             validate_declared_path(&self.name, path)?;
         }
         let mut env = BTreeSet::new();
@@ -275,6 +381,24 @@ impl Task {
             }
             if !env.insert(name) {
                 bail!("task `{}` repeats env input `{name}`", self.name);
+            }
+        }
+        for dependency in &self.depends_on {
+            if self
+                .dependency_cache_strategies
+                .get(dependency)
+                .is_some_and(|strategy| *strategy == DependencyCacheStrategy::Outputs)
+            {
+                // Whether the dependency actually declares outputs is checked after
+                // task inheritance and references have been resolved.
+            }
+        }
+        for tool in &self.tools {
+            if tool.program.trim().is_empty() {
+                bail!(
+                    "task `{}` has a tool probe with an empty program",
+                    self.name
+                );
             }
         }
         Ok(())

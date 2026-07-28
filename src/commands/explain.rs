@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,184 @@ pub(crate) fn run(
     }
 
     Ok(CommandOutput::success(render_explain(&task_hash)))
+}
+
+pub(crate) fn run_history(
+    cwd: &Path,
+    old_hash: &str,
+    new_hash: Option<&str>,
+    output_options: OutputOptions,
+) -> Result<CommandOutput> {
+    let workspace = workspace::discover_from(cwd)?;
+    let old = cache::load_hash_manifest(&workspace, old_hash)?
+        .with_context(|| format!("no local hash manifest found for `{old_hash}`"))?;
+    let Some(new_hash) = new_hash else {
+        if output_options.json {
+            let mut json = serde_json::to_string_pretty(&old)?;
+            json.push('\n');
+            return Ok(CommandOutput::success(json));
+        }
+        return Ok(CommandOutput::success(render_history(&old)));
+    };
+    let new = cache::load_hash_manifest(&workspace, new_hash)?
+        .with_context(|| format!("no local hash manifest found for `{new_hash}`"))?;
+    let report = diff_manifests(&old, &new);
+    if output_options.json {
+        let mut json = serde_json::to_string_pretty(&report)?;
+        json.push('\n');
+        return Ok(CommandOutput::success(json));
+    }
+    Ok(CommandOutput::success(render_manifest_diff(&report)))
+}
+
+fn render_history(manifest: &cache::HashManifest) -> String {
+    let mut output = format!(
+        "Historical Cache Key\nHash: {}\nIdentity: {}\nCommand: {}\nSchema: {}\nPlatform: {}/{}\n",
+        manifest.task_hash,
+        manifest.task_identity,
+        manifest.command,
+        manifest.schema_version,
+        manifest.operating_system,
+        manifest.architecture
+    );
+    output.push_str(&format!(
+        "Inputs: {}\nDependencies: {}\nToolchains: {}\nEnvironment digests: {}\n",
+        manifest.inputs.len(),
+        manifest.dependencies.len(),
+        manifest.toolchains.len(),
+        manifest.environment.len()
+    ));
+    if !manifest.missing_required_inputs.is_empty() {
+        output.push_str("Missing required inputs:\n");
+        for input in &manifest.missing_required_inputs {
+            output.push_str(&format!("- {input}\n"));
+        }
+    }
+    output
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestDiff {
+    old_hash: String,
+    new_hash: String,
+    groups: BTreeMap<String, Vec<String>>,
+}
+
+fn diff_manifests(old: &cache::HashManifest, new: &cache::HashManifest) -> ManifestDiff {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    if old.command != new.command
+        || old.arguments != new.arguments
+        || old.declared_outputs != new.declared_outputs
+    {
+        groups
+            .entry("command".to_string())
+            .or_default()
+            .push("command, arguments, or declared outputs changed".to_string());
+    }
+    compare_named(
+        &mut groups,
+        "input",
+        old.inputs.iter().map(|input| (&input.path, &input.blake3)),
+        new.inputs.iter().map(|input| (&input.path, &input.blake3)),
+    );
+    compare_named(
+        &mut groups,
+        "dependency",
+        old.dependencies
+            .iter()
+            .map(|dependency| (&dependency.identity, &dependency.digest)),
+        new.dependencies
+            .iter()
+            .map(|dependency| (&dependency.identity, &dependency.digest)),
+    );
+    compare_named(
+        &mut groups,
+        "environment",
+        old.environment
+            .iter()
+            .map(|environment| (&environment.name, &environment.value_blake3)),
+        new.environment
+            .iter()
+            .map(|environment| (&environment.name, &environment.value_blake3)),
+    );
+    compare_named(
+        &mut groups,
+        "toolchain",
+        old.toolchains
+            .iter()
+            .map(|toolchain| (&toolchain.program, &toolchain.fingerprint)),
+        new.toolchains
+            .iter()
+            .map(|toolchain| (&toolchain.program, &toolchain.fingerprint)),
+    );
+    if old.operating_system != new.operating_system || old.architecture != new.architecture {
+        groups
+            .entry("platform".to_string())
+            .or_default()
+            .push(format!(
+                "{}/{} -> {}/{}",
+                old.operating_system, old.architecture, new.operating_system, new.architecture
+            ));
+    }
+    if old.schema_version != new.schema_version || old.gomo_version != new.gomo_version {
+        groups
+            .entry("configuration".to_string())
+            .or_default()
+            .push(format!(
+                "schema/Gomo {}:{} -> {}:{}",
+                old.schema_version, old.gomo_version, new.schema_version, new.gomo_version
+            ));
+    }
+    ManifestDiff {
+        old_hash: old.task_hash.clone(),
+        new_hash: new.task_hash.clone(),
+        groups,
+    }
+}
+
+fn compare_named<'a>(
+    groups: &mut BTreeMap<String, Vec<String>>,
+    group: &str,
+    old: impl Iterator<Item = (&'a String, &'a String)>,
+    new: impl Iterator<Item = (&'a String, &'a String)>,
+) {
+    let old = old
+        .map(|(name, digest)| (name.as_str(), digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let new = new
+        .map(|(name, digest)| (name.as_str(), digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let names = old
+        .keys()
+        .chain(new.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for name in names {
+        if old.get(name) != new.get(name) {
+            groups
+                .entry(group.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    }
+}
+
+fn render_manifest_diff(diff: &ManifestDiff) -> String {
+    let mut output = format!(
+        "Cache Key Diff\nOld: {}\nNew: {}\n",
+        diff.old_hash, diff.new_hash
+    );
+    if diff.groups.is_empty() {
+        output.push_str("No logical hash ingredients changed.\n");
+    } else {
+        for (group, changes) in &diff.groups {
+            output.push_str(&format!("{}:\n", group));
+            for change in changes {
+                output.push_str(&format!("- {change}\n"));
+            }
+        }
+    }
+    output
 }
 
 fn find_project<'a>(workspace: &'a Workspace, project_name: &str) -> Result<&'a Project> {
@@ -136,9 +314,18 @@ fn render_explain(task_hash: &TaskHash) -> String {
     } else {
         for environment_input in &task_hash.environment {
             output.push_str(&format!(
-                "- {}={}\n",
-                environment_input.name, environment_input.value
+                "- {} blake3:{}\n",
+                environment_input.name,
+                blake3::hash(environment_input.value.as_bytes()).to_hex()
             ));
+        }
+    }
+    output.push_str("Missing Required Inputs:\n");
+    if task_hash.missing_required_inputs.is_empty() {
+        output.push_str("- (none)\n");
+    } else {
+        for input in &task_hash.missing_required_inputs {
+            output.push_str(&format!("- {input}\n"));
         }
     }
 
@@ -173,6 +360,7 @@ struct ExplainJson<'a> {
     workspace_input_files: Vec<InputFileJson<'a>>,
     dependency_hashes: Vec<DependencyHashJson<'a>>,
     environment: Vec<EnvironmentJson<'a>>,
+    missing_required_inputs: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -192,7 +380,7 @@ struct DependencyHashJson<'a> {
 #[derive(Serialize)]
 struct EnvironmentJson<'a> {
     name: &'a str,
-    value: &'a str,
+    value_blake3: String,
 }
 
 impl<'a> From<&'a TaskHash> for ExplainJson<'a> {
@@ -244,9 +432,12 @@ impl<'a> From<&'a TaskHash> for ExplainJson<'a> {
                 .iter()
                 .map(|environment| EnvironmentJson {
                     name: &environment.name,
-                    value: &environment.value,
+                    value_blake3: blake3::hash(environment.value.as_bytes())
+                        .to_hex()
+                        .to_string(),
                 })
                 .collect(),
+            missing_required_inputs: &task_hash.missing_required_inputs,
         }
     }
 }

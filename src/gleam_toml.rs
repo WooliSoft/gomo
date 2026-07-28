@@ -38,6 +38,8 @@ pub struct GomoTargetConfig {
     pub check_command: Option<String>,
     /// Optional build output directories to store and restore from cache.
     pub cached_folders: Option<Vec<String>>,
+    /// Whether this target may use an authenticated remote cache.
+    pub remote_cache: Option<bool>,
     /// Named task bound to this native target.
     pub task: Option<String>,
 }
@@ -147,6 +149,7 @@ struct RawGomoTarget {
     command: Option<String>,
     check: Option<RawGomoTargetCheck>,
     cached_folders: Option<Vec<String>>,
+    remote_cache: Option<bool>,
     task: Option<String>,
 }
 
@@ -307,6 +310,7 @@ fn insert_gomo_target(
                 command: config.command,
                 check_command: config.check.and_then(|check| check.command),
                 cached_folders: config.cached_folders,
+                remote_cache: config.remote_cache,
                 task: config.task,
             },
         );

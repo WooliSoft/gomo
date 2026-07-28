@@ -1,0 +1,16 @@
+[workspace]
+project_roots = ["apps/*"]
+
+[cache.remote]
+backend = "http"
+url = "http://127.0.0.1:7788"
+workspace = "wooli-local"
+mode = "read-write"
+failure = "error"
+
+[tasks.large]
+cache = true
+outputs = ["large.bin"]
+steps = [
+  { exec = { program = "sh", args = ["-c", "head -c 17825792 /dev/urandom > large.bin"] } },
+]

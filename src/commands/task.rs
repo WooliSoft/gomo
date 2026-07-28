@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 thread_local! {
     static TARGET_TASK_STACK: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
@@ -30,11 +31,14 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
 
-use crate::cache::CACHE_SCHEMA_VERSION;
+use crate::cache;
 use crate::commands::{CommandOutput, OutputOptions};
+use crate::remote_cache::RemoteCacheClient;
 use crate::runner::{CommandOptions, Target};
-use crate::task::{ExecAction, ShellAction, Task, TaskMode, TaskScope, TaskStep};
-use crate::workspace::{self, Project, Workspace};
+use crate::task::{
+    DependencyCacheStrategy, ExecAction, ShellAction, Task, TaskMode, TaskScope, TaskStep,
+};
+use crate::workspace::{self, Project, RemoteFailureMode, Workspace};
 
 use super::dev::DevRequest;
 use super::run::{CacheOptions, Parallelism, ProjectSelection, RunRequest};
@@ -141,10 +145,12 @@ pub(crate) fn explain(
         .map(|path| {
             path.strip_prefix(&workspace.root)
                 .unwrap_or(path.as_path())
-                .display()
-                .to_string()
+                .to_string_lossy()
+                .replace('\\', "/")
         })
         .collect::<Vec<_>>();
+    let missing_required_inputs =
+        named_task_missing_inputs(&workspace, task, project_name, &inputs)?;
     let hash = named_cache_entry(&workspace, task, project_name)?
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -161,6 +167,7 @@ pub(crate) fn explain(
                 "hash": hash,
                 "depends_on": task.depends_on,
                 "inputs": inputs,
+                "missing_required_inputs": missing_required_inputs,
                 "outputs": task.outputs,
                 "env_inputs": task.env_inputs,
                 "steps": task
@@ -186,9 +193,18 @@ pub(crate) fn explain(
     output.push_str("Dependencies:\n");
     render_values(&mut output, &task.depends_on);
     output.push_str("Declared Inputs:\n");
-    render_values(&mut output, &task.inputs);
+    render_values(
+        &mut output,
+        &task
+            .inputs
+            .iter()
+            .map(|input| input.glob().to_string())
+            .collect::<Vec<_>>(),
+    );
     output.push_str("Matched Inputs:\n");
     render_values(&mut output, &inputs);
+    output.push_str("Missing required inputs:\n");
+    render_values(&mut output, &missing_required_inputs);
     output.push_str("Outputs:\n");
     render_values(&mut output, &task.outputs);
     output.push_str("Environment Inputs:\n");
@@ -198,6 +214,34 @@ pub(crate) fn explain(
         output.push_str(&format!("{}. {}\n", index + 1, step.action_name()?));
     }
     Ok(CommandOutput::success(output))
+}
+
+fn named_task_missing_inputs(
+    workspace: &Workspace,
+    task: &Task,
+    project_name: Option<&str>,
+    matched_inputs: &[String],
+) -> Result<Vec<String>> {
+    let project = project_name
+        .map(|name| find_project(workspace, name))
+        .transpose()?;
+    let mut missing = Vec::new();
+    for input in &task.inputs {
+        if input.optional() {
+            continue;
+        }
+        let pattern = workspace_relative_pattern(workspace, project, input.glob())?;
+        let matcher = Glob::new(&pattern)
+            .with_context(|| format!("invalid input glob `{pattern}`"))?
+            .compile_matcher();
+        if !matched_inputs
+            .iter()
+            .any(|path| matcher.is_match(Path::new(path)))
+        {
+            missing.push(input.glob().to_string());
+        }
+    }
+    Ok(missing)
 }
 
 pub(crate) fn graph(
@@ -445,6 +489,12 @@ fn execute_task(
     output_options: OutputOptions,
     state: &Arc<Mutex<ExecutionState>>,
 ) -> Result<String> {
+    if cache_options.require_remote_cache
+        && !cache_options.no_remote_cache
+        && workspace.remote_cache.is_none()
+    {
+        bail!("--require-remote-cache was set, but no remote cache is configured");
+    }
     let identity = project_name
         .map(|project| format!("{project}:{}", task.name))
         .unwrap_or_else(|| task.name.clone());
@@ -489,19 +539,58 @@ fn execute_task(
 
     let cache_entry = if task.cache && !cache_options.no_cache {
         let entry = named_cache_entry(workspace, task, project_name)?;
-        if named_cache_hit(
-            workspace,
-            task,
-            project_name,
-            &entry,
-            cache_options.no_restore,
-        )? {
+        if !cache_options.no_restore
+            && let Some(cached) = named_cache_hit(workspace, task, project_name, &entry, false)?
+        {
             state
                 .lock()
                 .map_err(|_| anyhow!("task completion state was poisoned"))?
                 .completed
                 .insert(identity.clone());
-            return Ok(format!("✓ {identity} (cached)\n"));
+            output.push_str(&format!("✓ {identity} (cached)\n"));
+            output.push_str(&cached.stdout);
+            output.push_str(&cached.stderr);
+            return Ok(output);
+        }
+        if !cache_options.no_restore && !cache_options.no_remote_cache && task.remote_cache {
+            let descriptor = named_task_descriptor(workspace, task, project_name, &entry)?;
+            match RemoteCacheClient::from_workspace(workspace).and_then(|client| {
+                client
+                    .map(|client| client.restore_named(workspace, &descriptor))
+                    .transpose()
+            }) {
+                Ok(Some(Some(hit))) => {
+                    let cached = named_cache_hit(
+                        workspace,
+                        task,
+                        project_name,
+                        &entry,
+                        false,
+                    )?
+                    .context(
+                        "remote named-task entry was imported but could not be restored locally",
+                    )?;
+                    state
+                        .lock()
+                        .map_err(|_| anyhow!("task completion state was poisoned"))?
+                        .completed
+                        .insert(identity.clone());
+                    output.push_str(&format!(
+                        "✓ {identity} (cached remote scope={} bytes={})\n",
+                        hit.scope, hit.bytes_downloaded
+                    ));
+                    output.push_str(&cached.stdout);
+                    output.push_str(&cached.stderr);
+                    return Ok(output);
+                }
+                Ok(Some(None) | None) => {}
+                Err(error) if named_remote_failure_is_fatal(workspace, cache_options) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    output.push_str(&format!("[remote cache warning] {error}\n"));
+                }
+            }
         }
         Some(entry)
     } else {
@@ -557,10 +646,43 @@ fn execute_task(
         .map_err(|_| anyhow!("task completion state was poisoned"))?
         .completed
         .insert(identity);
-    if let Some(cache_entry) = cache_entry {
-        store_named_cache_entry(workspace, task, project_name, &cache_entry)?;
+    if cache_options.should_store()
+        && let Some(cache_entry) = cache_entry
+    {
+        store_named_cache_entry(workspace, task, project_name, &cache_entry, &output)?;
+        if !cache_options.no_remote_cache
+            && !cache_options.remote_cache_read_only
+            && task.remote_cache
+        {
+            let descriptor = named_task_descriptor(workspace, task, project_name, &cache_entry)?;
+            match RemoteCacheClient::from_workspace(workspace).and_then(|client| {
+                client
+                    .map(|client| client.store_named(workspace, &descriptor))
+                    .transpose()
+            }) {
+                Ok(Some(Some(stored))) => output.push_str(&format!(
+                    "[cache stored remote scope={} bytes={} outcome={:?}]\n",
+                    stored.scope, stored.bytes_uploaded, stored.outcome
+                )),
+                Ok(Some(None) | None) => {}
+                Err(error) if named_remote_failure_is_fatal(workspace, cache_options) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    output.push_str(&format!("[remote cache warning] upload failed: {error}\n"))
+                }
+            }
+        }
     }
     Ok(output)
+}
+
+fn named_remote_failure_is_fatal(workspace: &Workspace, cache_options: CacheOptions) -> bool {
+    cache_options.require_remote_cache
+        || workspace
+            .remote_cache
+            .as_ref()
+            .is_some_and(|config| config.failure == RemoteFailureMode::Error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -927,10 +1049,33 @@ fn named_cache_entry(
                 .as_bytes(),
         );
     }
+    for tool in &task.tools {
+        let fingerprint = toolchain_fingerprint(workspace, tool)?;
+        hasher.update(tool.program.as_bytes());
+        for argument in &tool.args {
+            hasher.update(argument.as_bytes());
+        }
+        hasher.update(fingerprint.as_bytes());
+    }
     for dependency in &task.depends_on {
         let dependency_task = select_task(workspace, dependency, project_name)?;
-        let dependency_entry = named_cache_entry(workspace, dependency_task, project_name)?;
-        hasher.update(dependency_entry.to_string_lossy().as_bytes());
+        match task
+            .dependency_cache_strategies
+            .get(dependency)
+            .copied()
+            .unwrap_or_default()
+        {
+            DependencyCacheStrategy::Hash => {
+                let dependency_entry = named_cache_entry(workspace, dependency_task, project_name)?;
+                hasher.update(dependency_entry.to_string_lossy().as_bytes());
+            }
+            DependencyCacheStrategy::Outputs => {
+                hasher.update(
+                    named_output_digest(workspace, dependency_task, project_name)?.as_bytes(),
+                );
+            }
+            DependencyCacheStrategy::Ignored => {}
+        }
     }
     for input in named_task_input_files(workspace, task, project_name)? {
         let relative = input
@@ -968,14 +1113,134 @@ fn named_cache_entry(
         }
     }
     let identity = project_name
-        .map(|project| format!("{project}-{}", task.name))
+        .map(|project| format!("{project}:{}", task.name))
         .unwrap_or_else(|| task.name.clone());
-    Ok(workspace
-        .cache_dir
-        .join(CACHE_SCHEMA_VERSION)
-        .join("named-task")
-        .join(identity)
-        .join(hasher.finalize().to_hex().as_str()))
+    let hash = hasher.finalize().to_hex().to_string();
+    let command = format!("{:?}", task.steps);
+    let descriptor = cache::NamedTaskCacheDescriptor {
+        hash_manifest: named_task_hash_manifest(
+            workspace,
+            task,
+            project_name,
+            &identity,
+            &command,
+            &hash,
+        )?,
+        identity,
+        task_name: task.name.clone(),
+        command,
+        hash,
+        declared_outputs: task.outputs.clone(),
+    };
+    Ok(cache::named_task_cache_entry_dir(workspace, &descriptor))
+}
+
+fn named_output_digest(
+    workspace: &Workspace,
+    task: &Task,
+    project_name: Option<&str>,
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut outputs = named_output_paths(workspace, task, project_name)?;
+    outputs.sort();
+    for output in outputs {
+        if !output.exists() {
+            bail!(
+                "dependency task `{}` is missing declared output {}",
+                task.name,
+                output.display()
+            );
+        }
+        for entry in WalkDir::new(&output)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry = entry?;
+            let relative = entry.path().strip_prefix(&workspace.root)?;
+            hasher.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_file() {
+                hasher.update(&metadata.len().to_le_bytes());
+                let mut file = File::open(entry.path())?;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+            } else if metadata.file_type().is_symlink() {
+                hasher.update(fs::read_link(entry.path())?.to_string_lossy().as_bytes());
+            }
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn toolchain_fingerprint(
+    workspace: &Workspace,
+    tool: &crate::task::ToolchainProbe,
+) -> Result<String> {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_OUTPUT: u64 = 64 * 1024;
+    let mut stdout = tempfile::tempfile().context("failed to create tool probe stdout spool")?;
+    let mut stderr = tempfile::tempfile().context("failed to create tool probe stderr spool")?;
+    let mut command = Command::new(&tool.program);
+    command
+        .args(&tool.args)
+        .current_dir(&workspace.root)
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if tool.optional && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("optional-tool-missing".to_string());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to run toolchain probe `{}`", tool.program));
+        }
+    };
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to poll toolchain probe")? {
+            break status;
+        }
+        if started.elapsed() >= TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "toolchain probe `{}` timed out after 5 seconds",
+                tool.program
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    stdout
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind toolchain probe stdout")?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind toolchain probe stderr")?;
+    let mut output = Vec::new();
+    stdout.take(MAX_OUTPUT + 1).read_to_end(&mut output)?;
+    stderr.take(MAX_OUTPUT + 1).read_to_end(&mut output)?;
+    if output.len() as u64 > MAX_OUTPUT {
+        bail!(
+            "toolchain probe `{}` exceeded the 65536-byte output limit",
+            tool.program
+        );
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tool.program.as_bytes());
+    for argument in &tool.args {
+        hasher.update(argument.as_bytes());
+    }
+    hasher.update(status.code().unwrap_or(-1).to_string().as_bytes());
+    hasher.update(&output);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn named_task_input_files(
@@ -990,15 +1255,15 @@ fn named_task_input_files(
     // Project tasks with no declared inputs still hash local `dev/**` so package
     // scripts and fixtures invalidate the cache, matching default target inputs.
     if project.is_some() && patterns.is_empty() {
-        patterns.push("dev/**".to_string());
+        patterns.push(crate::task::TaskInput::Glob("dev/**".to_string()));
     }
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let pattern = workspace_relative_pattern(workspace, project, &pattern)?;
+    for input in patterns {
+        let pattern = workspace_relative_pattern(workspace, project, input.glob())?;
         builder.add(
             Glob::new(&pattern).with_context(|| {
                 format!("invalid input glob `{pattern}` for task `{}`", task.name)
@@ -1094,23 +1359,28 @@ fn named_cache_hit(
     project_name: Option<&str>,
     entry: &Path,
     no_restore: bool,
-) -> Result<bool> {
-    if !entry.join("success").is_file() {
-        return Ok(false);
+) -> Result<Option<cache::CachedTaskExecution>> {
+    let descriptor = named_task_descriptor(workspace, task, project_name, entry)?;
+    if !cache::validate_named_task_entry(entry, &descriptor)? {
+        return Ok(None);
     }
     let outputs = named_output_paths(workspace, task, project_name)?;
     if outputs.is_empty() {
-        return Ok(true);
+        return cache::read_named_task_output(entry).map(Some);
     }
     let archive = entry.join("outputs.tar.zst");
     if no_restore {
-        return Ok(outputs.iter().all(|output| output.exists()));
+        return if outputs.iter().all(|output| output.exists()) {
+            cache::read_named_task_output(entry).map(Some)
+        } else {
+            Ok(None)
+        };
     }
     if !archive.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     restore_named_outputs(workspace, &outputs, &archive)?;
-    Ok(true)
+    cache::read_named_task_output(entry).map(Some)
 }
 
 fn store_named_cache_entry(
@@ -1118,10 +1388,21 @@ fn store_named_cache_entry(
     task: &Task,
     project_name: Option<&str>,
     entry: &Path,
+    output: &str,
 ) -> Result<()> {
-    fs::create_dir_all(entry)
-        .with_context(|| format!("failed to create task cache {}", entry.display()))?;
+    let descriptor = named_task_descriptor(workspace, task, project_name, entry)?;
+    if cache::validate_named_task_entry(entry, &descriptor)? {
+        return Ok(());
+    }
+    let parent = entry.parent().context("named cache entry has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".tmp-{}-{}", descriptor.hash, unique_suffix()));
+    if temp.exists() {
+        fs::remove_dir_all(&temp)?;
+    }
+    fs::create_dir(&temp)?;
     let outputs = named_output_paths(workspace, task, project_name)?;
+    let mut output_archive = None;
     if !outputs.is_empty() {
         for output in &outputs {
             if !output.exists() {
@@ -1132,21 +1413,161 @@ fn store_named_cache_entry(
                 );
             }
         }
-        let archive_file = File::create(entry.join("outputs.tar.zst"))?;
-        let encoder = zstd::stream::write::Encoder::new(archive_file, 0)?;
-        let mut archive = tar::Builder::new(encoder);
-        for output in &outputs {
-            let relative = output.strip_prefix(&workspace.root)?;
-            if output.is_dir() {
-                archive.append_dir_all(relative, output)?;
-            } else {
-                archive.append_path_with_name(output, relative)?;
-            }
-        }
-        archive.into_inner()?.finish()?;
+        let archive_path = temp.join("outputs.tar.zst");
+        cache::write_workspace_outputs_archive(&archive_path, workspace, &outputs)?;
+        output_archive = Some(archive_path);
     }
-    fs::write(entry.join("success"), b"ok\n")?;
+    cache::write_named_task_metadata(&temp, &descriptor, output, output_archive.as_deref())?;
+    if entry.exists() {
+        fs::remove_dir_all(entry)?;
+    }
+    fs::rename(&temp, entry)?;
     Ok(())
+}
+
+fn named_task_descriptor(
+    workspace: &Workspace,
+    task: &Task,
+    project_name: Option<&str>,
+    entry: &Path,
+) -> Result<cache::NamedTaskCacheDescriptor> {
+    let hash = entry
+        .file_name()
+        .context("named cache entry has no hash")?
+        .to_string_lossy()
+        .to_string();
+    let identity = task_identity(task, project_name);
+    let command = format!("{:?}", task.steps);
+    Ok(cache::NamedTaskCacheDescriptor {
+        hash_manifest: named_task_hash_manifest(
+            workspace,
+            task,
+            project_name,
+            &identity,
+            &command,
+            &hash,
+        )?,
+        identity,
+        task_name: task.name.clone(),
+        command,
+        hash,
+        declared_outputs: task.outputs.clone(),
+    })
+}
+
+fn named_task_hash_manifest(
+    workspace: &Workspace,
+    task: &Task,
+    project_name: Option<&str>,
+    identity: &str,
+    command: &str,
+    hash: &str,
+) -> Result<cache::HashManifest> {
+    let input_paths = named_task_input_files(workspace, task, project_name)?;
+    let matched_inputs = input_paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&workspace.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    let inputs = input_paths
+        .iter()
+        .zip(&matched_inputs)
+        .map(|(path, relative)| {
+            let contents =
+                fs::read(path).with_context(|| format!("failed to hash {}", path.display()))?;
+            Ok(cache::HashManifestInput {
+                path: relative.clone(),
+                blake3: blake3::hash(&contents).to_hex().to_string(),
+                byte_len: contents.len() as u64,
+                workspace: project_name.is_none(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut dependencies = Vec::new();
+    for dependency in &task.depends_on {
+        let dependency_task = select_task(workspace, dependency, project_name)?;
+        let (strategy, digest) = match task
+            .dependency_cache_strategies
+            .get(dependency)
+            .copied()
+            .unwrap_or_default()
+        {
+            DependencyCacheStrategy::Hash => {
+                let entry = named_cache_entry(workspace, dependency_task, project_name)?;
+                (
+                    "hash",
+                    entry
+                        .file_name()
+                        .context("dependency cache entry has no hash")?
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+            DependencyCacheStrategy::Outputs => (
+                "outputs",
+                named_output_digest(workspace, dependency_task, project_name)?,
+            ),
+            DependencyCacheStrategy::Ignored => ("ignored", String::new()),
+        };
+        dependencies.push(cache::HashManifestDependency {
+            identity: task_identity(dependency_task, project_name),
+            strategy: strategy.to_string(),
+            digest,
+        });
+    }
+    let toolchains = task
+        .tools
+        .iter()
+        .map(|tool| {
+            Ok(cache::HashManifestToolchain {
+                program: tool.program.clone(),
+                arguments: tool.args.clone(),
+                fingerprint: blake3::hash(toolchain_fingerprint(workspace, tool)?.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let environment = task
+        .env_inputs
+        .iter()
+        .map(|name| cache::HashManifestEnvironment {
+            name: name.clone(),
+            value_blake3: blake3::hash(
+                std::env::var_os(name)
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
+            .to_hex()
+            .to_string(),
+        })
+        .collect();
+    Ok(cache::HashManifest {
+        schema_version: cache::CACHE_SCHEMA_VERSION.to_string(),
+        task_hash: hash.to_string(),
+        task_identity: identity.to_string(),
+        command: command.to_string(),
+        arguments: Vec::new(),
+        declared_outputs: task.outputs.clone(),
+        inputs,
+        dependencies,
+        toolchains,
+        environment,
+        gomo_version: env!("CARGO_PKG_VERSION").to_string(),
+        operating_system: std::env::consts::OS.to_string(),
+        architecture: std::env::consts::ARCH.to_string(),
+        missing_required_inputs: named_task_missing_inputs(
+            workspace,
+            task,
+            project_name,
+            &matched_inputs,
+        )?,
+    })
 }
 
 fn restore_named_outputs(workspace: &Workspace, outputs: &[PathBuf], archive: &Path) -> Result<()> {
@@ -1176,16 +1597,14 @@ fn restore_named_outputs(workspace: &Workspace, outputs: &[PathBuf], archive: &P
         let archive_file = File::open(archive)?;
         let decoder = zstd::stream::read::Decoder::new(archive_file)?;
         let mut archive_reader = tar::Archive::new(decoder);
+        let mut symlinks = Vec::new();
         for entry in archive_reader.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.into_owned();
             if path.is_absolute()
-                || path.components().any(|component| {
-                    !matches!(
-                        component,
-                        std::path::Component::Normal(_) | std::path::Component::CurDir
-                    )
-                })
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
                 || !allowed.iter().any(|output| path.starts_with(output))
             {
                 bail!(
@@ -1193,13 +1612,23 @@ fn restore_named_outputs(workspace: &Workspace, outputs: &[PathBuf], archive: &P
                     path.display()
                 );
             }
-            if entry.header().entry_type().is_symlink()
-                || entry.header().entry_type().is_hard_link()
-            {
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_hard_link() {
                 bail!(
                     "cached named-task archive contains unsupported link at {}",
                     path.display()
                 );
+            }
+            if entry_type.is_symlink() {
+                let link_target = entry
+                    .link_name()
+                    .context("failed to read cached named-task symlink target")?
+                    .context("cached named-task symlink is missing its target")?
+                    .into_owned();
+                let resolved_target =
+                    resolve_named_output_symlink_target(&path, &link_target, &allowed)?;
+                symlinks.push((path, link_target, resolved_target));
+                continue;
             }
             let destination = temp_dir.join(&path);
             if let Some(parent) = destination.parent() {
@@ -1212,6 +1641,24 @@ fn restore_named_outputs(workspace: &Workspace, outputs: &[PathBuf], archive: &P
                     destination.display()
                 )
             })?;
+        }
+        for (path, link_target, resolved_target) in symlinks {
+            if !temp_dir.join(&resolved_target).exists() {
+                bail!(
+                    "cached named-task symlink {} points to missing target {}",
+                    path.display(),
+                    resolved_target.display()
+                );
+            }
+            let destination = temp_dir.join(&path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create_named_output_symlink(
+                &link_target,
+                &destination,
+                &temp_dir.join(&resolved_target),
+            )?;
         }
         Ok(())
     })();
@@ -1260,6 +1707,84 @@ fn unique_suffix() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("{}-{nanos}", std::process::id())
+}
+
+fn resolve_named_output_symlink_target(
+    symlink_path: &Path,
+    link_target: &Path,
+    allowed: &[PathBuf],
+) -> Result<PathBuf> {
+    if link_target.is_absolute() {
+        bail!(
+            "cached named-task symlink {} has absolute target {}",
+            symlink_path.display(),
+            link_target.display()
+        );
+    }
+    let mut resolved = symlink_path.parent().unwrap_or(Path::new("")).to_path_buf();
+    for component in link_target.components() {
+        match component {
+            Component::Normal(value) => resolved.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    bail!(
+                        "cached named-task symlink {} leaves declared outputs",
+                        symlink_path.display()
+                    );
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "cached named-task symlink {} has invalid target {}",
+                    symlink_path.display(),
+                    link_target.display()
+                );
+            }
+        }
+    }
+    if !allowed.iter().any(|output| resolved.starts_with(output)) {
+        bail!(
+            "cached named-task symlink {} leaves declared outputs",
+            symlink_path.display()
+        );
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn create_named_output_symlink(
+    link_target: &Path,
+    destination: &Path,
+    _resolved_target: &Path,
+) -> Result<()> {
+    std::os::unix::fs::symlink(link_target, destination).with_context(|| {
+        format!(
+            "failed to create cached named-task symlink {} -> {}",
+            destination.display(),
+            link_target.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn create_named_output_symlink(
+    link_target: &Path,
+    destination: &Path,
+    resolved_target: &Path,
+) -> Result<()> {
+    let result = if resolved_target.is_dir() {
+        std::os::windows::fs::symlink_dir(link_target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(link_target, destination)
+    };
+    result.with_context(|| {
+        format!(
+            "failed to create cached named-task symlink {} -> {}",
+            destination.display(),
+            link_target.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1423,6 +1948,7 @@ steps = [{ shell = { command = "cp input.txt output.txt" } }]
             CacheOptions {
                 no_cache: false,
                 no_restore: false,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -1435,6 +1961,7 @@ steps = [{ shell = { command = "cp input.txt output.txt" } }]
             CacheOptions {
                 no_cache: false,
                 no_restore: false,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -1445,6 +1972,76 @@ steps = [{ shell = { command = "cp input.txt output.txt" } }]
             fs::read_to_string(workspace.path().join("output.txt")).expect("output was restored"),
             "generated\n"
         );
+    }
+
+    #[test]
+    fn named_tasks_export_and_import_the_shared_remote_bundle_format() {
+        let workspace = TestWorkspace::new("gomo-named-task-bundle");
+        workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.generate]
+cache = true
+inputs = ["input.txt"]
+outputs = ["output.txt"]
+env_inputs = ["GOMO_NAMED_BUNDLE_TEST"]
+steps = [{ shell = { command = "cp input.txt output.txt" } }]
+"#,
+        );
+        workspace.write_file("input.txt", "generated\n");
+        run(
+            workspace.path(),
+            TaskRunRequest {
+                name: "generate".to_string(),
+                project: None,
+                parallelism: Parallelism::Fixed(1),
+            },
+            CacheOptions::default(),
+            OutputOptions::default(),
+        )
+        .expect("named task should populate its cache");
+
+        let discovered =
+            workspace::discover_from(workspace.path()).expect("workspace should discover");
+        let task = discovered.tasks.get("generate").expect("task should exist");
+        let entry = named_cache_entry(&discovered, task, None).expect("cache entry should resolve");
+        let descriptor = named_task_descriptor(&discovered, task, None, &entry)
+            .expect("descriptor should resolve");
+        let bundle = cache::export_named_task_bundle(&discovered, &descriptor)
+            .expect("named bundle should export");
+        fs::remove_dir_all(&entry).expect("local entry should be removable");
+
+        cache::import_named_task_bundle(
+            &discovered,
+            &descriptor,
+            &bundle.path,
+            &bundle.bundle_digest,
+            bundle.byte_len,
+            None,
+        )
+        .expect("named bundle should import");
+        assert!(
+            cache::validate_named_task_entry(&entry, &descriptor)
+                .expect("imported entry should validate")
+        );
+        assert!(
+            descriptor
+                .hash_manifest
+                .inputs
+                .iter()
+                .any(|input| input.path == "input.txt")
+        );
+        assert!(
+            descriptor
+                .hash_manifest
+                .environment
+                .iter()
+                .any(|input| input.name == "GOMO_NAMED_BUNDLE_TEST")
+        );
+        fs::remove_file(bundle.path).expect("bundle should be removable");
     }
 
     #[test]

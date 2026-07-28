@@ -7,15 +7,17 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::cache;
 use crate::cancellation::CancellationToken;
 use crate::commands::{CommandOutput, OutputOptions};
 use crate::graph::ProjectGraph;
+use crate::remote_cache::RemoteCacheClient;
 use crate::runner::{CommandOptions, CommandRunner, GleamCommandRunner, Target};
 use crate::ui;
-use crate::workspace::{self, DefaultParallelism, Project, Workspace};
+use crate::workspace::{self, DefaultParallelism, Project, RemoteFailureMode, Workspace};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunRequest {
@@ -26,10 +28,35 @@ pub(crate) struct RunRequest {
     pub(crate) parallelism: Parallelism,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CacheOptions {
     pub(crate) no_cache: bool,
     pub(crate) no_restore: bool,
+    pub(crate) no_store: bool,
+    pub(crate) no_remote_cache: bool,
+    pub(crate) remote_cache_read_only: bool,
+    pub(crate) require_remote_cache: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CacheMode {
+    Off,
+    Read,
+    Write,
+    #[default]
+    ReadWrite,
+}
+
+impl CacheMode {
+    pub(crate) fn parse_environment(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            "read-write" => Ok(Self::ReadWrite),
+            _ => bail!("GOMO_CACHE_MODE must be `off`, `read`, `write`, or `read-write`"),
+        }
+    }
 }
 
 impl CacheOptions {
@@ -38,12 +65,20 @@ impl CacheOptions {
         Self {
             no_cache: true,
             no_restore: true,
+            no_store: true,
+            no_remote_cache: true,
+            remote_cache_read_only: true,
+            require_remote_cache: false,
         }
     }
 
     fn should_use_cache(self, target: Target, command_options: CommandOptions) -> bool {
         let cacheable_command = !(target == Target::Format && command_options.format_check);
         target.supports_cache() && cacheable_command && !self.no_cache
+    }
+
+    pub(crate) fn should_store(self) -> bool {
+        !self.no_cache && !self.no_store
     }
 }
 
@@ -130,11 +165,22 @@ pub(crate) enum TaskCacheStatus {
     Bypassed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheSource {
+    Local,
+    Remote,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskOutcome {
     pub(crate) project: String,
     pub(crate) status: TaskStatus,
     pub(crate) cache_status: Option<TaskCacheStatus>,
+    pub(crate) cache_source: Option<CacheSource>,
+    pub(crate) remote_scope: Option<String>,
+    pub(crate) bytes_downloaded: u64,
+    pub(crate) bytes_uploaded: u64,
+    pub(crate) upload_result: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,6 +830,11 @@ where
                 project: project_name.clone(),
                 status: TaskStatus::Skipped,
                 cache_status: None,
+                cache_source: None,
+                remote_scope: None,
+                bytes_downloaded: 0,
+                bytes_uploaded: 0,
+                upload_result: None,
             };
             if let Some(terminal) = terminal.as_mut() {
                 terminal.task_skipped(&outcome)?;
@@ -980,6 +1031,12 @@ where
     R: CommandRunner + Sync,
     H: Fn(&Workspace, &ProjectGraph, &Project, Target) -> Result<cache::TaskHash> + Sync,
 {
+    if cache_options.require_remote_cache
+        && !cache_options.no_remote_cache
+        && workspace.remote_cache.is_none()
+    {
+        bail!("--require-remote-cache was set, but no remote cache is configured");
+    }
     let mut output = String::new();
     output.push_str(&format!(
         "==> {}:{} ({})\n",
@@ -995,7 +1052,7 @@ where
             output.push_str(&format!("[cache restore disabled] {}\n", task_hash.hash));
         } else if let Some(cached_execution) = restore_cached_task(workspace, project, &task_hash)?
         {
-            output.push_str(&format!("[cache hit] {}\n", task_hash.hash));
+            output.push_str(&format!("[cache hit local] {}\n", task_hash.hash));
             append_stream(&mut output, &cached_execution.stdout);
             append_stream(&mut output, &cached_execution.stderr);
             output.push('\n');
@@ -1005,8 +1062,56 @@ where
                     project: project.name.clone(),
                     status: TaskStatus::Succeeded,
                     cache_status: Some(TaskCacheStatus::Hit),
+                    cache_source: Some(CacheSource::Local),
+                    remote_scope: None,
+                    bytes_downloaded: 0,
+                    bytes_uploaded: 0,
+                    upload_result: None,
                 },
             });
+        } else if !cache_options.no_remote_cache && target_remote_eligible(project, target) {
+            match RemoteCacheClient::from_workspace(workspace).and_then(|client| {
+                client
+                    .map(|client| client.restore(workspace, &task_hash))
+                    .transpose()
+            }) {
+                Ok(Some(Some(hit))) => {
+                    let cached_execution = restore_cached_task(workspace, project, &task_hash)?
+                        .context(
+                            "remote cache entry was imported but could not be restored locally",
+                        )?;
+                    output.push_str(&format!(
+                        "[cache hit remote scope={} bytes={}] {}\n",
+                        hit.scope, hit.bytes_downloaded, task_hash.hash
+                    ));
+                    append_stream(&mut output, &cached_execution.stdout);
+                    append_stream(&mut output, &cached_execution.stderr);
+                    output.push('\n');
+                    return Ok(CompletedTask {
+                        output,
+                        outcome: TaskOutcome {
+                            project: project.name.clone(),
+                            status: TaskStatus::Succeeded,
+                            cache_status: Some(TaskCacheStatus::Hit),
+                            cache_source: Some(CacheSource::Remote),
+                            remote_scope: Some(hit.scope),
+                            bytes_downloaded: hit.bytes_downloaded,
+                            bytes_uploaded: 0,
+                            upload_result: None,
+                        },
+                    });
+                }
+                Ok(Some(None) | None) => {
+                    output.push_str(&format!("[cache miss] {}\n", task_hash.hash));
+                }
+                Err(error) if remote_failure_is_fatal(workspace, cache_options) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    output.push_str(&format!("[remote cache warning] {error}\n"));
+                    output.push_str(&format!("[cache miss] {}\n", task_hash.hash));
+                }
+            }
         } else {
             output.push_str(&format!("[cache miss] {}\n", task_hash.hash));
         }
@@ -1034,8 +1139,13 @@ where
         }
     });
 
+    let mut upload_scope = None;
+    let mut bytes_uploaded = 0;
+    let mut upload_result = None;
     let status = if execution.is_success() {
-        if let Some(task_hash) = &task_hash {
+        if cache_options.should_store()
+            && let Some(task_hash) = &task_hash
+        {
             let task_hash_for_store = if target.refreshes_cache_key_after_success() {
                 compute_task_hash(workspace, graph, project, target)
             } else {
@@ -1056,7 +1166,42 @@ where
                         &task_hash_for_store,
                         &execution,
                     ) {
-                        Ok(()) => output.push_str("[cache stored]\n"),
+                        Ok(()) => {
+                            output.push_str("[cache stored local]\n");
+                            if !cache_options.no_remote_cache
+                                && !cache_options.remote_cache_read_only
+                                && target_remote_eligible(project, target)
+                            {
+                                match RemoteCacheClient::from_workspace(workspace).and_then(
+                                    |client| {
+                                        client
+                                            .map(|client| {
+                                                client.store(workspace, &task_hash_for_store)
+                                            })
+                                            .transpose()
+                                    },
+                                ) {
+                                    Ok(Some(Some(store))) => {
+                                        output.push_str(&format!(
+                                            "[cache stored remote scope={} bytes={} outcome={:?}]\n",
+                                            store.scope, store.bytes_uploaded, store.outcome
+                                        ));
+                                        upload_scope = Some(store.scope);
+                                        bytes_uploaded = store.bytes_uploaded;
+                                        upload_result = Some(format!("{:?}", store.outcome));
+                                    }
+                                    Ok(Some(None) | None) => {}
+                                    Err(error)
+                                        if remote_failure_is_fatal(workspace, cache_options) =>
+                                    {
+                                        return Err(error);
+                                    }
+                                    Err(error) => output.push_str(&format!(
+                                        "[remote cache warning] upload failed: {error}\n"
+                                    )),
+                                }
+                            }
+                        }
                         Err(error) => output.push_str(&format!("[cache store failed] {error}\n")),
                     }
                 }
@@ -1084,8 +1229,29 @@ where
             project: project.name.clone(),
             status,
             cache_status,
+            cache_source: None,
+            remote_scope: upload_scope,
+            bytes_downloaded: 0,
+            bytes_uploaded,
+            upload_result,
         },
     })
+}
+
+fn remote_failure_is_fatal(workspace: &Workspace, cache_options: CacheOptions) -> bool {
+    cache_options.require_remote_cache
+        || workspace
+            .remote_cache
+            .as_ref()
+            .is_some_and(|config| config.failure == RemoteFailureMode::Error)
+}
+
+fn target_remote_eligible(project: &Project, target: Target) -> bool {
+    project
+        .gomo_targets
+        .get(target.as_str())
+        .and_then(|config| config.remote_cache)
+        .unwrap_or(true)
 }
 
 fn restore_cached_task(
@@ -1311,6 +1477,11 @@ struct TaskOutcomeJson<'a> {
     status: &'static str,
     exit_code: Option<i32>,
     cache: Option<&'static str>,
+    cache_source: Option<&'static str>,
+    remote_scope: Option<&'a str>,
+    bytes_downloaded: u64,
+    bytes_uploaded: u64,
+    upload_result: Option<&'a str>,
 }
 
 impl<'a> From<&'a TaskSummary> for TaskSummaryJson<'a> {
@@ -1333,6 +1504,11 @@ impl<'a> From<&'a TaskSummary> for TaskSummaryJson<'a> {
                     status: outcome.status.as_str(),
                     exit_code: outcome.status.exit_code(),
                     cache: outcome.cache_status.map(TaskCacheStatus::as_str),
+                    cache_source: outcome.cache_source.map(CacheSource::as_str),
+                    remote_scope: outcome.remote_scope.as_deref(),
+                    bytes_downloaded: outcome.bytes_downloaded,
+                    bytes_uploaded: outcome.bytes_uploaded,
+                    upload_result: outcome.upload_result.as_deref(),
                 })
                 .collect(),
         }
@@ -1362,6 +1538,15 @@ impl TaskCacheStatus {
             Self::Hit => "hit",
             Self::Miss => "miss",
             Self::Bypassed => "bypassed",
+        }
+    }
+}
+
+impl CacheSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
         }
     }
 }
@@ -1743,6 +1928,11 @@ version = "0.1.0"
                 project: "protocol".to_string(),
                 status: TaskStatus::Succeeded,
                 cache_status: Some(TaskCacheStatus::Miss),
+                cache_source: None,
+                remote_scope: None,
+                bytes_downloaded: 0,
+                bytes_uploaded: 0,
+                upload_result: None,
             }],
         };
         let project_names = vec!["protocol".to_string()];
@@ -2066,6 +2256,7 @@ version = "0.1.0"
             CacheOptions {
                 no_cache: false,
                 no_restore: false,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -2095,6 +2286,7 @@ version = "0.1.0"
             CacheOptions {
                 no_cache: true,
                 no_restore: true,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -2170,6 +2362,7 @@ version = "0.1.0"
             CacheOptions {
                 no_cache: false,
                 no_restore: false,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -2247,6 +2440,7 @@ command = "mise exec -- gleam format --check"
             CacheOptions {
                 no_cache: false,
                 no_restore: false,
+                ..CacheOptions::default()
             },
             OutputOptions::default(),
         )
@@ -2275,6 +2469,7 @@ command = "mise exec -- gleam format --check"
         let cache_options = CacheOptions {
             no_cache: false,
             no_restore: false,
+            ..CacheOptions::default()
         };
 
         let first = execute_tasks_with_hasher(
@@ -2295,7 +2490,7 @@ command = "mise exec -- gleam format --check"
         assert_eq!(runner.calls(), ["protocol:format"]);
         assert!(first.stdout.contains("[cache miss]"));
         assert!(first.stdout.contains("[cache key updated]"));
-        assert!(first.stdout.contains("[cache stored]"));
+        assert!(first.stdout.contains("[cache stored local]"));
         assert!(first.stdout.contains("Cache Misses: 1"));
 
         let second = execute_tasks_with_hasher(
@@ -2314,7 +2509,7 @@ command = "mise exec -- gleam format --check"
         .expect("cached format task should run");
 
         assert_eq!(runner.calls(), ["protocol:format"]);
-        assert!(second.stdout.contains("[cache hit]"));
+        assert!(second.stdout.contains("[cache hit local]"));
         assert!(second.stdout.contains("formatted"));
         assert!(second.stdout.contains("Cache Hits: 1"));
         assert!(second.stdout.contains("[cached] protocol:format"));
@@ -2336,6 +2531,7 @@ command = "mise exec -- gleam format --check"
         let cache_options = CacheOptions {
             no_cache: false,
             no_restore: false,
+            ..CacheOptions::default()
         };
 
         let first = execute_tasks_with_hasher(
@@ -2355,7 +2551,7 @@ command = "mise exec -- gleam format --check"
 
         assert_eq!(runner.calls(), ["protocol:test"]);
         assert!(first.stdout.contains("[cache miss]"));
-        assert!(first.stdout.contains("[cache stored]"));
+        assert!(first.stdout.contains("[cache stored local]"));
         assert!(first.stdout.contains("Cache Misses: 1"));
 
         let second = execute_tasks_with_hasher(
@@ -2374,7 +2570,7 @@ command = "mise exec -- gleam format --check"
         .expect("cached test task should run");
 
         assert_eq!(runner.calls(), ["protocol:test"]);
-        assert!(second.stdout.contains("[cache hit]"));
+        assert!(second.stdout.contains("[cache hit local]"));
         assert!(second.stdout.contains("protocol passed"));
         assert!(second.stdout.contains("Cache Hits: 1"));
         assert!(second.stdout.contains("[cached] protocol:test"));
@@ -2399,6 +2595,7 @@ command = "mise exec -- gleam format --check"
         let cache_options = CacheOptions {
             no_cache: false,
             no_restore: false,
+            ..CacheOptions::default()
         };
 
         let output = execute_tasks_with_hasher(
@@ -2422,7 +2619,7 @@ command = "mise exec -- gleam format --check"
         assert_eq!(runner.calls(), ["protocol:test"]);
         assert_eq!(output.exit_code, 9);
         assert!(output.stdout.contains("[cache miss]"));
-        assert!(!output.stdout.contains("[cache stored]"));
+        assert!(!output.stdout.contains("[cache stored local]"));
         assert!(
             cache::restore_successful_test(&workspace, &task_hash)
                 .expect("cache lookup should succeed")

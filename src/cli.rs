@@ -30,12 +30,24 @@ const HELP_STYLES: Styles = Styles::styled()
     styles = HELP_STYLES
 )]
 struct Cli {
+    /// Select cache reads and writes coherently.
+    #[arg(long, global = true, value_enum)]
+    cache_mode: Option<commands::run::CacheMode>,
     /// Force commands to run without reading from or writing to the local cache.
     #[arg(long, global = true)]
     no_cache: bool,
     /// Do not restore cached task outputs; successful builds can still refresh cache entries.
     #[arg(long, global = true)]
     no_restore: bool,
+    /// Use only the local cache even when a remote is configured.
+    #[arg(long, global = true)]
+    no_remote_cache: bool,
+    /// Read remote entries but never upload them.
+    #[arg(long, global = true)]
+    remote_cache_read_only: bool,
+    /// Treat remote configuration, authentication, and service failures as fatal.
+    #[arg(long, global = true)]
+    require_remote_cache: bool,
     /// Maximum number of tasks to run concurrently.
     #[arg(long, global = true, value_name = "n|auto")]
     parallel: Option<commands::run::Parallelism>,
@@ -109,6 +121,12 @@ enum Commands {
         /// Project name to explain or project exposing the named task.
         #[arg(long, add = ArgValueCandidates::new(completion::project_candidates))]
         project: Option<String>,
+        /// Inspect a historical local-cache hash manifest.
+        #[arg(long)]
+        hash: Option<String>,
+        /// Compare two historical hashes as OLD..NEW.
+        #[arg(long, value_name = "OLD..NEW")]
+        diff: Option<String>,
     },
     /// Inspect the workspace dependency graph.
     Graph {
@@ -317,9 +335,33 @@ fn execute_from_with_terminal(
     interactive_terminal: bool,
     terminal_width: Option<u16>,
 ) -> Result<CommandOutput> {
+    let configured_mode = match cli.cache_mode {
+        Some(mode) => mode,
+        None => env::var("GOMO_CACHE_MODE")
+            .ok()
+            .map(|value| commands::run::CacheMode::parse_environment(&value))
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    let (mut no_cache, mut no_restore, no_store) = match configured_mode {
+        commands::run::CacheMode::Off => (true, true, true),
+        commands::run::CacheMode::Read => (false, false, true),
+        commands::run::CacheMode::Write => (false, true, false),
+        commands::run::CacheMode::ReadWrite => (false, false, false),
+    };
+    if cli.no_cache {
+        no_cache = true;
+        no_restore = true;
+    } else if cli.no_restore {
+        no_restore = true;
+    }
     let cache_options = commands::run::CacheOptions {
-        no_cache: cli.no_cache,
-        no_restore: cli.no_restore,
+        no_cache,
+        no_restore,
+        no_store: no_store || cli.no_cache,
+        no_remote_cache: cli.no_remote_cache,
+        remote_cache_read_only: cli.remote_cache_read_only,
+        require_remote_cache: cli.require_remote_cache,
     };
     let parallelism = cli
         .parallel
@@ -388,8 +430,10 @@ fn execute_from_with_terminal(
             target,
             task,
             project,
-        }) => match (target, task) {
-            (Some(target), None) => commands::explain::run(
+            hash,
+            diff,
+        }) => match (target, task, hash, diff) {
+            (Some(target), None, None, None) => commands::explain::run(
                 cwd,
                 commands::explain::ExplainRequest {
                     target,
@@ -398,10 +442,20 @@ fn execute_from_with_terminal(
                 },
                 output_options,
             ),
-            (None, Some(task)) => {
+            (None, Some(task), None, None) => {
                 commands::task::explain(cwd, &task, project.as_deref(), output_options)
             }
-            _ => bail!("explain requires exactly one of --target or --task"),
+            (None, None, Some(hash), None) if project.is_none() => {
+                commands::explain::run_history(cwd, &hash, None, output_options)
+            }
+            (None, None, None, Some(diff)) if project.is_none() => {
+                let (old, new) = diff
+                    .split_once("..")
+                    .filter(|(old, new)| !old.is_empty() && !new.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("--diff must use OLD..NEW"))?;
+                commands::explain::run_history(cwd, old, Some(new), output_options)
+            }
+            _ => bail!("explain requires exactly one of --target, --task, --hash, or --diff"),
         },
         Some(Commands::Test { selection }) => run_shorthand(
             cwd,
@@ -1163,6 +1217,7 @@ version = "0.1.0"
                 target,
                 task,
                 project,
+                ..
             }) => {
                 assert_eq!(target, Some(Target::Test));
                 assert_eq!(task, None);

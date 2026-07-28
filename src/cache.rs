@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v5";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = "v6";
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -72,6 +72,7 @@ pub(crate) struct TaskHash {
     pub(crate) workspace_input_files: Vec<HashedInputFile>,
     pub(crate) dependency_hashes: Vec<DependencyTaskHash>,
     pub(crate) environment: Vec<EnvironmentInput>,
+    pub(crate) missing_required_inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +180,11 @@ fn compute_task_hash_inner(
     let workspace_input_files = expand_workspace_input_globs(workspace, &workspace_input_globs)?;
     let manifest_hash = hash_file(&project.manifest_path)?.content_hash;
     let environment = collect_environment();
+    let mut missing_required_inputs = missing_project_inputs(&input_config, &input_files)?;
+    missing_required_inputs.extend(missing_globs(
+        &workspace_input_globs,
+        &workspace_input_files,
+    )?);
     let operating_system = env::consts::OS;
     let architecture = env::consts::ARCH;
     let mut dependency_hashes = Vec::new();
@@ -303,10 +309,51 @@ fn compute_task_hash_inner(
         workspace_input_files,
         dependency_hashes,
         environment,
+        missing_required_inputs,
     };
 
     memo.insert(memo_key, task_hash.clone());
     Ok(task_hash)
+}
+
+fn missing_project_inputs(
+    config: &InputGlobConfig,
+    files: &[HashedInputFile],
+) -> Result<Vec<String>> {
+    const BUILT_IN_OPTIONAL: &[&str] = &[
+        "manifest.toml",
+        "dev/**",
+        "package.json",
+        "bun.lock",
+        "vite.config.*",
+        "tsconfig*.json",
+        "index.html",
+    ];
+    let globs = config
+        .globs
+        .iter()
+        .filter(|glob| {
+            config.source != InputGlobSource::BuiltIn || !BUILT_IN_OPTIONAL.contains(&glob.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    missing_globs(&globs, files)
+}
+
+fn missing_globs(globs: &[String], files: &[HashedInputFile]) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for glob in globs {
+        let matcher = Glob::new(glob)
+            .with_context(|| format!("invalid input glob `{glob}`"))?
+            .compile_matcher();
+        if !files
+            .iter()
+            .any(|file| matcher.is_match(Path::new(&file.relative_path)))
+        {
+            missing.push(glob.clone());
+        }
+    }
+    Ok(missing)
 }
 
 fn ensure_cacheable_target(target: Target) -> Result<()> {
@@ -870,8 +917,8 @@ fn cache_prune_candidates(workspace: &Workspace) -> Result<Vec<CachePruneCandida
 
     let mut candidates = Vec::new();
     for entry in WalkDir::new(&task_root)
-        .min_depth(3)
-        .max_depth(3)
+        .min_depth(2)
+        .max_depth(2)
         .follow_links(false)
     {
         let entry = entry.with_context(|| format!("failed to walk {}", task_root.display()))?;
@@ -1026,12 +1073,17 @@ struct CacheEntryMetadata {
     target: String,
     command: String,
     hash: String,
+    task_identity: String,
+    target_or_task_name: String,
     gleam_version: String,
     input_globs: Vec<String>,
     stdout: CacheArtifactMetadata,
     stderr: CacheArtifactMetadata,
     cached_folders: Vec<String>,
+    declared_output_paths: Vec<String>,
+    hash_manifest: CacheArtifactMetadata,
     output_archive: Option<CacheArtifactMetadata>,
+    result_digest: String,
     created_at_unix_seconds: u64,
 }
 
@@ -1039,6 +1091,681 @@ struct CacheEntryMetadata {
 struct CacheArtifactMetadata {
     blake3: String,
     byte_len: u64,
+}
+
+pub(crate) const REMOTE_PROTOCOL_VERSION: &str = "v1";
+const REMOTE_BUNDLE_MEDIA_TYPE: &str = "application/vnd.gomo.cache.v1+zstd";
+const DEFAULT_MAX_BUNDLE_EXPANDED_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BundleManifest {
+    protocol_version: String,
+    cache_schema_version: String,
+    task_hash: String,
+    task_identity: String,
+    result_digest: String,
+    files: BTreeMap<String, CacheArtifactMetadata>,
+    total_expanded_bytes: u64,
+    created_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExportedBundle {
+    pub(crate) path: PathBuf,
+    pub(crate) bundle_digest: String,
+    pub(crate) result_digest: String,
+    pub(crate) byte_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedTaskCacheDescriptor {
+    pub(crate) identity: String,
+    pub(crate) task_name: String,
+    pub(crate) command: String,
+    pub(crate) hash: String,
+    pub(crate) declared_outputs: Vec<String>,
+    pub(crate) hash_manifest: HashManifest,
+}
+
+pub(crate) fn named_task_cache_entry_dir(
+    workspace: &Workspace,
+    descriptor: &NamedTaskCacheDescriptor,
+) -> PathBuf {
+    task_cache_identity_dir(workspace, &descriptor.identity)
+        .join(cache_path_component(&descriptor.hash))
+}
+
+pub(crate) fn write_named_task_metadata(
+    entry_dir: &Path,
+    descriptor: &NamedTaskCacheDescriptor,
+    stdout_contents: &str,
+    output_archive_path: Option<&Path>,
+) -> Result<()> {
+    let stdout = write_cache_text_artifact(&entry_dir.join("stdout.txt"), stdout_contents)?;
+    let stderr = write_cache_text_artifact(&entry_dir.join("stderr.txt"), "")?;
+    let manifest = descriptor.hash_manifest.clone();
+    if manifest.schema_version != CACHE_SCHEMA_VERSION
+        || manifest.task_hash != descriptor.hash
+        || manifest.task_identity != descriptor.identity
+        || manifest.command != descriptor.command
+        || manifest.declared_outputs != descriptor.declared_outputs
+    {
+        bail!("named-task hash manifest does not match its cache descriptor");
+    }
+    let mut manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    manifest_json.push(b'\n');
+    let manifest_path = entry_dir.join("hash-manifest.json");
+    fs::write(&manifest_path, manifest_json)?;
+    let hash_manifest = hash_cache_artifact(&manifest_path)?;
+    let output_archive = output_archive_path.map(hash_cache_artifact).transpose()?;
+    let result_digest = named_result_digest(
+        descriptor,
+        &stdout,
+        &stderr,
+        &hash_manifest,
+        output_archive.as_ref(),
+    );
+    let metadata = CacheEntryMetadata {
+        schema_version: CACHE_SCHEMA_VERSION.to_string(),
+        gomo_version: env!("CARGO_PKG_VERSION").to_string(),
+        operating_system: env::consts::OS.to_string(),
+        architecture: env::consts::ARCH.to_string(),
+        project: String::new(),
+        project_root: String::new(),
+        project_target: String::new(),
+        target: descriptor.task_name.clone(),
+        command: descriptor.command.clone(),
+        hash: descriptor.hash.clone(),
+        task_identity: descriptor.identity.clone(),
+        target_or_task_name: descriptor.task_name.clone(),
+        gleam_version: String::new(),
+        input_globs: Vec::new(),
+        stdout,
+        stderr,
+        cached_folders: descriptor.declared_outputs.clone(),
+        declared_output_paths: descriptor.declared_outputs.clone(),
+        hash_manifest,
+        output_archive,
+        result_digest,
+        created_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    };
+    let mut json = serde_json::to_vec_pretty(&metadata)?;
+    json.push(b'\n');
+    fs::write(entry_dir.join("meta.json"), json)?;
+    Ok(())
+}
+
+pub(crate) fn validate_named_task_entry(
+    entry_dir: &Path,
+    descriptor: &NamedTaskCacheDescriptor,
+) -> Result<bool> {
+    let metadata_text = match fs::read_to_string(entry_dir.join("meta.json")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = match serde_json::from_str::<CacheEntryMetadata>(&metadata_text) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false),
+    };
+    if metadata.schema_version != CACHE_SCHEMA_VERSION
+        || metadata.hash != descriptor.hash
+        || metadata.task_identity != descriptor.identity
+        || metadata.target_or_task_name != descriptor.task_name
+        || metadata.command != descriptor.command
+        || metadata.declared_output_paths != descriptor.declared_outputs
+    {
+        return Ok(false);
+    }
+    if !artifact_matches(&entry_dir.join("stdout.txt"), &metadata.stdout)?
+        || !artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?
+        || !artifact_matches(
+            &entry_dir.join("hash-manifest.json"),
+            &metadata.hash_manifest,
+        )?
+    {
+        return Ok(false);
+    }
+    match &metadata.output_archive {
+        Some(artifact) => artifact_matches(&entry_dir.join("outputs.tar.zst"), artifact),
+        None => Ok(descriptor.declared_outputs.is_empty()),
+    }
+}
+
+pub(crate) fn read_named_task_output(entry_dir: &Path) -> Result<CachedTaskExecution> {
+    Ok(CachedTaskExecution {
+        stdout: read_optional_string(&entry_dir.join("stdout.txt"))?,
+        stderr: read_optional_string(&entry_dir.join("stderr.txt"))?,
+    })
+}
+
+fn named_result_digest(
+    descriptor: &NamedTaskCacheDescriptor,
+    stdout: &CacheArtifactMetadata,
+    stderr: &CacheArtifactMetadata,
+    hash_manifest: &CacheArtifactMetadata,
+    output_archive: Option<&CacheArtifactMetadata>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, "schema", CACHE_SCHEMA_VERSION);
+    hash_field(&mut hasher, "task_hash", &descriptor.hash);
+    hash_field(&mut hasher, "task_identity", &descriptor.identity);
+    for artifact in [stdout, stderr, hash_manifest] {
+        hash_field(&mut hasher, "artifact_blake3", &artifact.blake3);
+        hash_field(
+            &mut hasher,
+            "artifact_bytes",
+            &artifact.byte_len.to_string(),
+        );
+    }
+    if let Some(artifact) = output_archive {
+        hash_field(&mut hasher, "outputs_blake3", &artifact.blake3);
+        hash_field(&mut hasher, "outputs_bytes", &artifact.byte_len.to_string());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn remote_bundle_media_type() -> &'static str {
+    REMOTE_BUNDLE_MEDIA_TYPE
+}
+
+pub(crate) fn export_task_bundle(
+    workspace: &Workspace,
+    task_hash: &TaskHash,
+) -> Result<ExportedBundle> {
+    let entry_dir = task_cache_entry_dir(workspace, task_hash);
+    let metadata = read_valid_metadata(&entry_dir, task_hash)?
+        .context("cannot export an incomplete cache entry")?;
+    if !is_complete_task_cache_entry(&entry_dir, task_hash)? {
+        bail!("cannot export an incomplete cache entry");
+    }
+    export_entry_bundle(
+        workspace,
+        &entry_dir,
+        &task_hash.hash,
+        &metadata.task_identity,
+        &metadata.result_digest,
+        metadata.output_archive.is_some(),
+    )
+}
+
+pub(crate) fn export_named_task_bundle(
+    workspace: &Workspace,
+    descriptor: &NamedTaskCacheDescriptor,
+) -> Result<ExportedBundle> {
+    let entry_dir = named_task_cache_entry_dir(workspace, descriptor);
+    if !validate_named_task_entry(&entry_dir, descriptor)? {
+        bail!("cannot export an incomplete named-task cache entry");
+    }
+    let metadata: CacheEntryMetadata = serde_json::from_slice(
+        &fs::read(entry_dir.join("meta.json")).context("failed to read named-task metadata")?,
+    )
+    .context("invalid named-task metadata")?;
+    export_entry_bundle(
+        workspace,
+        &entry_dir,
+        &descriptor.hash,
+        &descriptor.identity,
+        &metadata.result_digest,
+        metadata.output_archive.is_some(),
+    )
+}
+
+fn export_entry_bundle(
+    workspace: &Workspace,
+    entry_dir: &Path,
+    task_hash: &str,
+    task_identity: &str,
+    result_digest: &str,
+    has_output_archive: bool,
+) -> Result<ExportedBundle> {
+    let mut files = BTreeMap::new();
+    for name in [
+        "meta.json",
+        "hash-manifest.json",
+        "stdout.txt",
+        "stderr.txt",
+    ] {
+        files.insert(
+            name.to_string(),
+            hash_cache_artifact(&entry_dir.join(name))?,
+        );
+    }
+    if has_output_archive {
+        files.insert(
+            "outputs.tar.zst".to_string(),
+            hash_cache_artifact(&entry_dir.join("outputs.tar.zst"))?,
+        );
+    }
+    let total_expanded_bytes = files.values().map(|artifact| artifact.byte_len).sum();
+    let manifest = BundleManifest {
+        protocol_version: REMOTE_PROTOCOL_VERSION.to_string(),
+        cache_schema_version: CACHE_SCHEMA_VERSION.to_string(),
+        task_hash: task_hash.to_string(),
+        task_identity: task_identity.to_string(),
+        result_digest: result_digest.to_string(),
+        files,
+        total_expanded_bytes,
+        created_by: format!("gomo/{}", env!("CARGO_PKG_VERSION")),
+    };
+    let mut manifest_json =
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize bundle manifest")?;
+    manifest_json.push(b'\n');
+
+    let transfer_dir = workspace
+        .cache_dir
+        .join(CACHE_SCHEMA_VERSION)
+        .join(".transfers");
+    fs::create_dir_all(&transfer_dir)
+        .with_context(|| format!("failed to create {}", transfer_dir.display()))?;
+    let path = transfer_dir.join(format!(
+        "{}-{}.bundle.tar.zst",
+        cache_path_component(task_hash),
+        unique_suffix()
+    ));
+    let file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut encoder =
+        zstd::stream::write::Encoder::new(file, 3).context("failed to create bundle encoder")?;
+    encoder
+        .include_checksum(true)
+        .context("failed to configure bundle checksum")?;
+    let mut archive = tar::Builder::new(encoder);
+    archive.mode(tar::HeaderMode::Deterministic);
+    append_bundle_bytes(&mut archive, "bundle.json", &manifest_json, 0o644)?;
+    for name in manifest.files.keys() {
+        append_bundle_file(
+            &mut archive,
+            &entry_dir.join(name),
+            &Path::new("entry").join(name),
+        )?;
+    }
+    let encoder = archive
+        .into_inner()
+        .context("failed to finish bundle tar")?;
+    encoder.finish().context("failed to finish bundle zstd")?;
+    let artifact = hash_cache_artifact(&path)?;
+    Ok(ExportedBundle {
+        path,
+        bundle_digest: artifact.blake3,
+        result_digest: result_digest.to_string(),
+        byte_len: artifact.byte_len,
+    })
+}
+
+fn append_bundle_bytes<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    path: &str,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let mut header = deterministic_regular_header(contents.len() as u64, mode);
+    archive
+        .append_data(&mut header, path, contents)
+        .with_context(|| format!("failed to append {path} to cache bundle"))
+}
+
+fn append_bundle_file<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    source: &Path,
+    path: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect {}", source.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "cache bundle artifact {} is not a regular file",
+            source.display()
+        );
+    }
+    let mut header = deterministic_regular_header(metadata.len(), 0o644);
+    let mut file =
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    archive
+        .append_data(&mut header, path, &mut file)
+        .with_context(|| format!("failed to append {}", source.display()))
+}
+
+fn deterministic_regular_header(byte_len: u64, mode: u32) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_mode(mode);
+    header.set_size(byte_len);
+    header.set_cksum();
+    header
+}
+
+pub(crate) fn import_task_bundle(
+    workspace: &Workspace,
+    task_hash: &TaskHash,
+    bundle_path: &Path,
+    expected_bundle_digest: &str,
+    expected_byte_len: u64,
+    max_expanded_bytes: Option<u64>,
+) -> Result<()> {
+    let bundle_artifact = hash_cache_artifact(bundle_path)?;
+    if bundle_artifact.byte_len != expected_byte_len
+        || bundle_artifact.blake3 != expected_bundle_digest
+    {
+        bail!("remote cache bundle digest or byte length did not match response metadata");
+    }
+    let entry_dir = task_cache_entry_dir(workspace, task_hash);
+    let parent = entry_dir
+        .parent()
+        .context("cache entry should have a parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let temp_dir = parent.join(format!(
+        ".tmp-import-{}-{}",
+        task_hash.hash,
+        unique_suffix()
+    ));
+    fs::create_dir(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+
+    let import_result = (|| -> Result<()> {
+        let manifest = extract_and_validate_bundle(
+            bundle_path,
+            &temp_dir,
+            &task_hash.hash,
+            max_expanded_bytes,
+        )?;
+        let metadata = read_valid_metadata(&temp_dir, task_hash)?
+            .context("cache bundle metadata does not match the requested task")?;
+        if metadata.result_digest != manifest.result_digest {
+            bail!("cache bundle result digest does not match entry metadata");
+        }
+        if !is_complete_task_cache_entry(&temp_dir, task_hash)? {
+            bail!("cache bundle contains an incomplete task entry");
+        }
+        Ok(())
+    })();
+    if let Err(error) = import_result {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(error);
+    }
+
+    let _lock = match acquire_cache_entry_lock(
+        parent,
+        task_hash,
+        &entry_dir,
+        is_complete_task_cache_entry,
+    )? {
+        Some(lock) => lock,
+        None => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Ok(());
+        }
+    };
+    if entry_dir.exists() {
+        remove_path(&entry_dir)?;
+    }
+    fs::rename(&temp_dir, &entry_dir).with_context(|| {
+        format!(
+            "failed to install imported cache entry {}",
+            entry_dir.display()
+        )
+    })
+}
+
+pub(crate) fn import_named_task_bundle(
+    workspace: &Workspace,
+    descriptor: &NamedTaskCacheDescriptor,
+    bundle_path: &Path,
+    expected_bundle_digest: &str,
+    expected_byte_len: u64,
+    max_expanded_bytes: Option<u64>,
+) -> Result<()> {
+    let bundle_artifact = hash_cache_artifact(bundle_path)?;
+    if bundle_artifact.byte_len != expected_byte_len
+        || bundle_artifact.blake3 != expected_bundle_digest
+    {
+        bail!("remote cache bundle digest or byte length did not match response metadata");
+    }
+    let entry_dir = named_task_cache_entry_dir(workspace, descriptor);
+    let parent = entry_dir
+        .parent()
+        .context("named cache entry should have a parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let temp_dir = parent.join(format!(
+        ".tmp-import-{}-{}",
+        descriptor.hash,
+        unique_suffix()
+    ));
+    fs::create_dir(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    let import_result = (|| -> Result<()> {
+        let manifest = extract_and_validate_bundle(
+            bundle_path,
+            &temp_dir,
+            &descriptor.hash,
+            max_expanded_bytes,
+        )?;
+        if manifest.task_identity != descriptor.identity {
+            bail!("cache bundle task identity does not match the requested named task");
+        }
+        if !validate_named_task_entry(&temp_dir, descriptor)? {
+            bail!("cache bundle metadata does not match the requested named task");
+        }
+        let metadata: CacheEntryMetadata =
+            serde_json::from_slice(&fs::read(temp_dir.join("meta.json"))?)
+                .context("invalid named-task metadata")?;
+        if metadata.result_digest != manifest.result_digest {
+            bail!("cache bundle result digest does not match named-task metadata");
+        }
+        Ok(())
+    })();
+    if let Err(error) = import_result {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(error);
+    }
+
+    let lock_dir = parent.join(format!(".lock-{}", descriptor.hash));
+    let mut attempt = 0;
+    let _lock = loop {
+        match fs::create_dir(&lock_dir) {
+            Ok(()) => break CacheEntryLock { path: lock_dir },
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if validate_named_task_entry(&entry_dir, descriptor)? {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    return Ok(());
+                }
+                if is_stale_path(&lock_dir, STALE_CACHE_WORK_DIR_SECONDS)? {
+                    remove_path(&lock_dir)?;
+                    continue;
+                }
+                if attempt == CACHE_STORE_LOCK_ATTEMPTS {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    bail!(
+                        "timed out waiting for cache entry lock {}",
+                        lock_dir.display()
+                    );
+                }
+                attempt += 1;
+                thread::sleep(CACHE_STORE_LOCK_RETRY_DELAY);
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temp_dir);
+                return Err(error).with_context(|| {
+                    format!("failed to create cache lock {}", lock_dir.display())
+                });
+            }
+        }
+    };
+    if entry_dir.exists() {
+        remove_path(&entry_dir)?;
+    }
+    fs::rename(&temp_dir, &entry_dir).with_context(|| {
+        format!(
+            "failed to install imported named cache entry {}",
+            entry_dir.display()
+        )
+    })
+}
+
+fn extract_and_validate_bundle(
+    bundle_path: &Path,
+    temp_dir: &Path,
+    task_hash: &str,
+    max_expanded_bytes: Option<u64>,
+) -> Result<BundleManifest> {
+    let limit = max_expanded_bytes.unwrap_or(DEFAULT_MAX_BUNDLE_EXPANDED_BYTES);
+    let file = File::open(bundle_path)
+        .with_context(|| format!("failed to open {}", bundle_path.display()))?;
+    let decoder =
+        zstd::stream::read::Decoder::new(file).context("failed to decode cache bundle")?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut bundle_manifest = None;
+    let mut expanded = 0_u64;
+    let mut seen_paths = BTreeSet::new();
+    for entry in archive.entries().context("failed to read cache bundle")? {
+        let mut entry = entry.context("failed to read cache bundle entry")?;
+        let path = entry
+            .path()
+            .context("failed to read bundle path")?
+            .into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !entry.header().entry_type().is_file()
+        {
+            bail!("cache bundle contains unsafe entry {}", path.display());
+        }
+        if !seen_paths.insert(path.clone()) {
+            bail!("cache bundle contains duplicate entry {}", path.display());
+        }
+        expanded = expanded
+            .checked_add(entry.size())
+            .context("cache bundle expanded size overflow")?;
+        if expanded > limit {
+            bail!("cache bundle exceeds the configured expanded size limit");
+        }
+        if path == Path::new("bundle.json") {
+            let mut bytes = Vec::new();
+            (&mut entry)
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .context("failed to read bundle.json")?;
+            if bytes.len() > 1024 * 1024 {
+                bail!("bundle.json exceeds the metadata limit");
+            }
+            bundle_manifest = Some(
+                serde_json::from_slice::<BundleManifest>(&bytes).context("invalid bundle.json")?,
+            );
+            continue;
+        }
+        let relative = path
+            .strip_prefix("entry")
+            .context("cache bundle entry is outside entry/")?;
+        let name = relative
+            .to_str()
+            .context("cache bundle entry path is not UTF-8")?;
+        if !is_allowed_bundle_artifact(name) || relative.components().count() != 1 {
+            bail!(
+                "cache bundle contains unexpected artifact {}",
+                path.display()
+            );
+        }
+        entry
+            .unpack(temp_dir.join(relative))
+            .with_context(|| format!("failed to unpack {}", path.display()))?;
+    }
+    let manifest = bundle_manifest.context("cache bundle is missing bundle.json")?;
+    if manifest.protocol_version != REMOTE_PROTOCOL_VERSION
+        || manifest.cache_schema_version != CACHE_SCHEMA_VERSION
+        || manifest.task_hash != task_hash
+    {
+        bail!("cache bundle protocol, schema, or task hash does not match request");
+    }
+    if manifest.total_expanded_bytes > limit {
+        bail!("cache bundle declares an oversized expanded payload");
+    }
+    let extracted_artifacts = seen_paths
+        .iter()
+        .filter_map(|path| path.strip_prefix("entry").ok())
+        .filter_map(Path::to_str)
+        .collect::<BTreeSet<_>>();
+    let declared_artifacts = manifest
+        .files
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if extracted_artifacts != declared_artifacts {
+        bail!("cache bundle artifact set does not match bundle.json");
+    }
+    for (name, expected) in &manifest.files {
+        if !is_allowed_bundle_artifact(name) || !artifact_matches(&temp_dir.join(name), expected)? {
+            bail!("cache bundle artifact `{name}` failed integrity validation");
+        }
+    }
+    Ok(manifest)
+}
+
+fn is_allowed_bundle_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        "meta.json" | "hash-manifest.json" | "stdout.txt" | "stderr.txt" | "outputs.tar.zst"
+    )
+}
+
+fn is_complete_task_cache_entry(entry_dir: &Path, task_hash: &TaskHash) -> Result<bool> {
+    match task_hash.target {
+        Target::Build => is_complete_build_cache_entry(entry_dir, task_hash),
+        Target::Format | Target::Test => is_complete_output_cache_entry(entry_dir, task_hash),
+        Target::Clean => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HashManifest {
+    pub(crate) schema_version: String,
+    pub(crate) task_hash: String,
+    pub(crate) task_identity: String,
+    pub(crate) command: String,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) declared_outputs: Vec<String>,
+    pub(crate) inputs: Vec<HashManifestInput>,
+    pub(crate) dependencies: Vec<HashManifestDependency>,
+    pub(crate) toolchains: Vec<HashManifestToolchain>,
+    pub(crate) environment: Vec<HashManifestEnvironment>,
+    pub(crate) gomo_version: String,
+    pub(crate) operating_system: String,
+    pub(crate) architecture: String,
+    pub(crate) missing_required_inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HashManifestInput {
+    pub(crate) path: String,
+    pub(crate) blake3: String,
+    pub(crate) byte_len: u64,
+    pub(crate) workspace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HashManifestDependency {
+    pub(crate) identity: String,
+    pub(crate) strategy: String,
+    pub(crate) digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HashManifestToolchain {
+    pub(crate) program: String,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HashManifestEnvironment {
+    pub(crate) name: String,
+    pub(crate) value_blake3: String,
 }
 
 pub(crate) fn restore_successful_build(
@@ -1167,11 +1894,13 @@ pub(crate) fn store_successful_build(
         write_build_outputs_archive(&archive_path, project, &task_hash.cached_folders)
             .with_context(|| format!("failed to archive build outputs for `{}`", project.name))?;
         let output_archive = hash_cache_artifact(&archive_path)?;
+        let hash_manifest = write_hash_manifest(&temp_dir.join("hash-manifest.json"), task_hash)?;
         write_cache_metadata(
             &temp_dir.join("meta.json"),
             task_hash,
             stdout,
             stderr,
+            hash_manifest,
             Some(output_archive),
         )
         .with_context(|| format!("failed to write cache metadata for `{}`", project.name))?;
@@ -1278,8 +2007,16 @@ fn store_successful_output_task(
             .with_context(|| format!("failed to write cached stdout for `{}`", project.name))?;
         let stderr = write_cache_text_artifact(&temp_dir.join("stderr.txt"), &execution.stderr)
             .with_context(|| format!("failed to write cached stderr for `{}`", project.name))?;
-        write_cache_metadata(&temp_dir.join("meta.json"), task_hash, stdout, stderr, None)
-            .with_context(|| format!("failed to write cache metadata for `{}`", project.name))?;
+        let hash_manifest = write_hash_manifest(&temp_dir.join("hash-manifest.json"), task_hash)?;
+        write_cache_metadata(
+            &temp_dir.join("meta.json"),
+            task_hash,
+            stdout,
+            stderr,
+            hash_manifest,
+            None,
+        )
+        .with_context(|| format!("failed to write cache metadata for `{}`", project.name))?;
         Ok(())
     })();
 
@@ -1314,12 +2051,131 @@ fn write_cache_metadata(
     task_hash: &TaskHash,
     stdout: CacheArtifactMetadata,
     stderr: CacheArtifactMetadata,
+    hash_manifest: CacheArtifactMetadata,
     output_archive: Option<CacheArtifactMetadata>,
 ) -> Result<()> {
-    let metadata = CacheEntryMetadata::from_task_hash(task_hash, stdout, stderr, output_archive);
+    let metadata = CacheEntryMetadata::from_task_hash(
+        task_hash,
+        stdout,
+        stderr,
+        hash_manifest,
+        output_archive,
+    );
     let metadata_json =
         serde_json::to_string_pretty(&metadata).context("failed to serialize cache metadata")?;
     fs::write(path, metadata_json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_hash_manifest(path: &Path, task_hash: &TaskHash) -> Result<CacheArtifactMetadata> {
+    let manifest = hash_manifest(task_hash);
+    let mut json =
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize hash manifest")?;
+    json.push(b'\n');
+    fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
+    hash_cache_artifact(path)
+}
+
+pub(crate) fn hash_manifest(task_hash: &TaskHash) -> HashManifest {
+    let mut inputs = task_hash
+        .input_files
+        .iter()
+        .map(|input| HashManifestInput {
+            path: input.relative_path.clone(),
+            blake3: input.content_hash.clone(),
+            byte_len: input.byte_len,
+            workspace: false,
+        })
+        .chain(
+            task_hash
+                .workspace_input_files
+                .iter()
+                .map(|input| HashManifestInput {
+                    path: input.relative_path.clone(),
+                    blake3: input.content_hash.clone(),
+                    byte_len: input.byte_len,
+                    workspace: true,
+                }),
+        )
+        .collect::<Vec<_>>();
+    inputs.sort_by(|left, right| {
+        left.workspace
+            .cmp(&right.workspace)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    HashManifest {
+        schema_version: task_hash.schema_version.clone(),
+        task_hash: task_hash.hash.clone(),
+        task_identity: format!("{}:{}", task_hash.project, task_hash.target.as_str()),
+        command: task_hash.command.clone(),
+        arguments: Vec::new(),
+        declared_outputs: task_hash.cached_folders.clone(),
+        inputs,
+        dependencies: task_hash
+            .dependency_hashes
+            .iter()
+            .map(|dependency| HashManifestDependency {
+                identity: format!("{}:{}", dependency.project, dependency.target.as_str()),
+                strategy: "hash".to_string(),
+                digest: dependency.hash.clone(),
+            })
+            .collect(),
+        toolchains: vec![HashManifestToolchain {
+            program: "gleam".to_string(),
+            arguments: vec!["--version".to_string()],
+            fingerprint: blake3::hash(task_hash.gleam_version.as_bytes())
+                .to_hex()
+                .to_string(),
+        }],
+        environment: task_hash
+            .environment
+            .iter()
+            .map(|environment| HashManifestEnvironment {
+                name: environment.name.clone(),
+                value_blake3: blake3::hash(environment.value.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            })
+            .collect(),
+        gomo_version: task_hash.gomo_version.clone(),
+        operating_system: task_hash.operating_system.clone(),
+        architecture: task_hash.architecture.clone(),
+        missing_required_inputs: task_hash.missing_required_inputs.clone(),
+    }
+}
+
+pub(crate) fn load_hash_manifest(
+    workspace: &Workspace,
+    task_hash: &str,
+) -> Result<Option<HashManifest>> {
+    let task_root = workspace.cache_dir.join(CACHE_SCHEMA_VERSION).join("task");
+    let identities = match fs::read_dir(&task_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", task_root.display()));
+        }
+    };
+    for identity in identities {
+        let identity = identity?;
+        if !identity.file_type()?.is_dir() {
+            continue;
+        }
+        let path = identity
+            .path()
+            .join(cache_path_component(task_hash))
+            .join("hash-manifest.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        return serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid hash manifest {}", path.display()))
+            .map(Some);
+    }
+    Ok(None)
 }
 
 struct CacheEntryLock {
@@ -1374,17 +2230,23 @@ fn acquire_cache_entry_lock(
 }
 
 pub(crate) fn task_cache_entry_dir(workspace: &Workspace, task_hash: &TaskHash) -> PathBuf {
-    task_cache_target_dir(workspace, &task_hash.project, task_hash.target)
-        .join(cache_path_component(&task_hash.hash))
+    task_cache_identity_dir(
+        workspace,
+        &format!("{}:{}", task_hash.project, task_hash.target.as_str()),
+    )
+    .join(cache_path_component(&task_hash.hash))
 }
 
 fn task_cache_target_dir(workspace: &Workspace, project: &str, target: Target) -> PathBuf {
+    task_cache_identity_dir(workspace, &format!("{project}:{}", target.as_str()))
+}
+
+fn task_cache_identity_dir(workspace: &Workspace, identity: &str) -> PathBuf {
     workspace
         .cache_dir
         .join(CACHE_SCHEMA_VERSION)
         .join("task")
-        .join(cache_path_component(project))
-        .join(cache_path_component(target.as_str()))
+        .join(cache_path_component(identity))
 }
 
 impl CacheEntryMetadata {
@@ -1392,8 +2254,17 @@ impl CacheEntryMetadata {
         task_hash: &TaskHash,
         stdout: CacheArtifactMetadata,
         stderr: CacheArtifactMetadata,
+        hash_manifest: CacheArtifactMetadata,
         output_archive: Option<CacheArtifactMetadata>,
     ) -> Self {
+        let task_identity = format!("{}:{}", task_hash.project, task_hash.target.as_str());
+        let result_digest = result_digest(
+            task_hash,
+            &stdout,
+            &stderr,
+            &hash_manifest,
+            output_archive.as_ref(),
+        );
         Self {
             schema_version: task_hash.schema_version.clone(),
             gomo_version: task_hash.gomo_version.clone(),
@@ -1405,12 +2276,17 @@ impl CacheEntryMetadata {
             target: task_hash.target.as_str().to_string(),
             command: task_hash.command.clone(),
             hash: task_hash.hash.clone(),
+            task_identity,
+            target_or_task_name: task_hash.target.as_str().to_string(),
             gleam_version: task_hash.gleam_version.clone(),
             input_globs: task_hash.input_globs.clone(),
             cached_folders: task_hash.cached_folders.clone(),
+            declared_output_paths: task_hash.cached_folders.clone(),
             stdout,
             stderr,
+            hash_manifest,
             output_archive,
+            result_digest,
             created_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -1432,6 +2308,40 @@ impl CacheEntryMetadata {
             && self.gleam_version == task_hash.gleam_version
             && self.cached_folders == task_hash.cached_folders
     }
+}
+
+fn result_digest(
+    task_hash: &TaskHash,
+    stdout: &CacheArtifactMetadata,
+    stderr: &CacheArtifactMetadata,
+    hash_manifest: &CacheArtifactMetadata,
+    output_archive: Option<&CacheArtifactMetadata>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, "schema", &task_hash.schema_version);
+    hash_field(&mut hasher, "task_hash", &task_hash.hash);
+    hash_field(
+        &mut hasher,
+        "task_identity",
+        &format!("{}:{}", task_hash.project, task_hash.target.as_str()),
+    );
+    for (name, artifact) in [
+        ("stdout", stdout),
+        ("stderr", stderr),
+        ("hash_manifest", hash_manifest),
+    ] {
+        hash_field(&mut hasher, &format!("{name}_blake3"), &artifact.blake3);
+        hash_field(
+            &mut hasher,
+            &format!("{name}_bytes"),
+            &artifact.byte_len.to_string(),
+        );
+    }
+    if let Some(artifact) = output_archive {
+        hash_field(&mut hasher, "outputs_blake3", &artifact.blake3);
+        hash_field(&mut hasher, "outputs_bytes", &artifact.byte_len.to_string());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn ensure_build_hash(task_hash: &TaskHash) -> Result<()> {
@@ -1497,6 +2407,30 @@ fn read_valid_metadata(
     }
 }
 
+pub(crate) fn task_result_digest(
+    workspace: &Workspace,
+    task_hash: &TaskHash,
+) -> Result<Option<String>> {
+    Ok(
+        read_valid_metadata(&task_cache_entry_dir(workspace, task_hash), task_hash)?
+            .map(|metadata| metadata.result_digest),
+    )
+}
+
+pub(crate) fn named_task_result_digest(
+    workspace: &Workspace,
+    descriptor: &NamedTaskCacheDescriptor,
+) -> Result<Option<String>> {
+    let entry_dir = named_task_cache_entry_dir(workspace, descriptor);
+    if !validate_named_task_entry(&entry_dir, descriptor)? {
+        return Ok(None);
+    }
+    let metadata: CacheEntryMetadata =
+        serde_json::from_slice(&fs::read(entry_dir.join("meta.json"))?)
+            .context("invalid named-task metadata")?;
+    Ok(Some(metadata.result_digest))
+}
+
 fn read_optional_string(path: &Path) -> Result<String> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -1516,6 +2450,10 @@ fn is_complete_build_cache_entry(entry_dir: &Path, task_hash: &TaskHash) -> Resu
     Ok(
         artifact_matches(&entry_dir.join("stdout.txt"), &metadata.stdout)?
             && artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?
+            && artifact_matches(
+                &entry_dir.join("hash-manifest.json"),
+                &metadata.hash_manifest,
+            )?
             && artifact_matches(&entry_dir.join("outputs.tar.zst"), output_archive)?,
     )
 }
@@ -1527,7 +2465,11 @@ fn is_complete_output_cache_entry(entry_dir: &Path, task_hash: &TaskHash) -> Res
 
     Ok(metadata.output_archive.is_none()
         && artifact_matches(&entry_dir.join("stdout.txt"), &metadata.stdout)?
-        && artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?)
+        && artifact_matches(&entry_dir.join("stderr.txt"), &metadata.stderr)?
+        && artifact_matches(
+            &entry_dir.join("hash-manifest.json"),
+            &metadata.hash_manifest,
+        )?)
 }
 
 fn artifact_matches(path: &Path, expected: &CacheArtifactMetadata) -> Result<bool> {
@@ -1569,9 +2511,13 @@ fn write_build_outputs_archive(
 ) -> Result<()> {
     let archive_file = File::create(archive_path)
         .with_context(|| format!("failed to create {}", archive_path.display()))?;
-    let encoder = zstd::stream::write::Encoder::new(archive_file, 0)
+    let mut encoder = zstd::stream::write::Encoder::new(archive_file, 3)
         .context("failed to create zstd encoder")?;
+    encoder
+        .include_checksum(true)
+        .context("failed to configure zstd checksum")?;
     let mut archive = tar::Builder::new(encoder);
+    archive.mode(tar::HeaderMode::Deterministic);
     let cached_output_dirs = cached_folders
         .iter()
         .map(|folder| {
@@ -1582,14 +2528,32 @@ fn write_build_outputs_archive(
             Ok((canonical_dir, PathBuf::from(folder)))
         })
         .collect::<Result<Vec<(PathBuf, PathBuf)>>>()?;
+    let mut entries = Vec::new();
     for folder in cached_folders {
         let output_dir = project.root.join(folder);
-        append_cached_output_tree(
-            &mut archive,
-            &output_dir,
-            Path::new(folder),
-            &cached_output_dirs,
-        )?;
+        for entry in WalkDir::new(&output_dir)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry =
+                entry.with_context(|| format!("failed to walk {}", output_dir.display()))?;
+            let relative = entry
+                .path()
+                .strip_prefix(&output_dir)
+                .with_context(|| {
+                    format!(
+                        "failed to compute relative path for {} from {}",
+                        entry.path().display(),
+                        output_dir.display()
+                    )
+                })?
+                .to_path_buf();
+            entries.push((entry.into_path(), Path::new(folder).join(relative)));
+        }
+    }
+    entries.sort_by(|left, right| normalize_path(&left.1).cmp(&normalize_path(&right.1)));
+    for (source, archive_path) in entries {
+        append_deterministic_output(&mut archive, &source, &archive_path, &cached_output_dirs)?;
     }
     let encoder = archive
         .into_inner()
@@ -1598,72 +2562,132 @@ fn write_build_outputs_archive(
     Ok(())
 }
 
-fn append_cached_output_tree<W: std::io::Write>(
-    archive: &mut tar::Builder<W>,
-    root: &Path,
-    archive_root: &Path,
-    cached_output_dirs: &[(PathBuf, PathBuf)],
+pub(crate) fn write_workspace_outputs_archive(
+    archive_path: &Path,
+    workspace: &Workspace,
+    outputs: &[PathBuf],
 ) -> Result<()> {
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
-        let relative_path = entry.path().strip_prefix(root).with_context(|| {
-            format!(
-                "failed to compute relative path for {} from {}",
-                entry.path().display(),
-                root.display()
-            )
-        })?;
-        let archive_path = archive_root.join(relative_path);
-
-        if entry.file_type().is_symlink() {
-            let target = entry.path().canonicalize().with_context(|| {
-                format!(
-                    "failed to resolve cached output symlink {}",
-                    entry.path().display()
-                )
-            })?;
-            let target_archive_path = cached_output_dirs
-                .iter()
-                .find_map(|(output_dir, output_archive_root)| {
-                    target
-                        .strip_prefix(output_dir)
-                        .ok()
-                        .map(|relative_target| output_archive_root.join(relative_target))
-                })
-                .with_context(|| {
-                    format!(
-                        "cached output symlink {} resolves outside configured cached folders",
-                        entry.path().display()
-                    )
-                })?;
-            let link_parent = archive_path.parent().unwrap_or(Path::new(""));
-            let link_target = relative_path_between(link_parent, &target_archive_path)?;
-            let metadata = fs::symlink_metadata(entry.path())
-                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-            let mut header = tar::Header::new_gnu();
-            header.set_metadata(&metadata);
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            archive
-                .append_link(&mut header, &archive_path, &link_target)
-                .with_context(|| {
-                    format!(
-                        "failed to append cached output symlink {}",
-                        entry.path().display()
-                    )
-                })?;
+    let archive_file = File::create(archive_path)
+        .with_context(|| format!("failed to create {}", archive_path.display()))?;
+    let mut encoder = zstd::stream::write::Encoder::new(archive_file, 3)?;
+    encoder.include_checksum(true)?;
+    let mut archive = tar::Builder::new(encoder);
+    archive.mode(tar::HeaderMode::Deterministic);
+    let output_roots = outputs
+        .iter()
+        .filter(|output| output.is_dir())
+        .map(|output| {
+            Ok((
+                output.canonicalize()?,
+                output.strip_prefix(&workspace.root)?.to_path_buf(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut entries = Vec::<(PathBuf, PathBuf)>::new();
+    for output in outputs {
+        let relative = output.strip_prefix(&workspace.root)?.to_path_buf();
+        if output.is_dir() {
+            for entry in WalkDir::new(output).follow_links(false).sort_by_file_name() {
+                let entry = entry?;
+                entries.push((
+                    entry.path().to_path_buf(),
+                    relative.join(entry.path().strip_prefix(output)?),
+                ));
+            }
         } else {
-            archive
-                .append_path_with_name(entry.path(), &archive_path)
-                .with_context(|| {
-                    format!(
-                        "failed to append {} to output archive",
-                        entry.path().display()
-                    )
-                })?;
+            entries.push((output.clone(), relative));
         }
     }
+    entries.sort_by(|left, right| normalize_path(&left.1).cmp(&normalize_path(&right.1)));
+    for (source, path) in entries {
+        append_deterministic_output(&mut archive, &source, &path, &output_roots)?;
+    }
+    let encoder = archive.into_inner()?;
+    encoder.finish()?;
     Ok(())
+}
+
+fn append_deterministic_output<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+    cached_output_dirs: &[(PathBuf, PathBuf)],
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect {}", source.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    if metadata.file_type().is_symlink() {
+        let target = source.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve cached output symlink {}",
+                source.display()
+            )
+        })?;
+        let target_archive_path = cached_output_dirs
+            .iter()
+            .find_map(|(output_dir, output_archive_root)| {
+                target
+                    .strip_prefix(output_dir)
+                    .ok()
+                    .map(|relative_target| output_archive_root.join(relative_target))
+            })
+            .with_context(|| {
+                format!(
+                    "cached output symlink {} resolves outside configured cached folders",
+                    source.display()
+                )
+            })?;
+        let link_parent = archive_path.parent().unwrap_or(Path::new(""));
+        let link_target = relative_path_between(link_parent, &target_archive_path)?;
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        header
+            .set_link_name(&link_target)
+            .context("failed to set deterministic symlink target")?;
+        header.set_cksum();
+        archive.append_data(&mut header, archive_path, std::io::empty())?;
+    } else if metadata.is_dir() {
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        header.set_cksum();
+        archive.append_data(&mut header, archive_path, std::io::empty())?;
+    } else if metadata.is_file() {
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(portable_file_mode(&metadata));
+        header.set_size(metadata.len());
+        header.set_cksum();
+        let mut file =
+            File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+        archive
+            .append_data(&mut header, archive_path, &mut file)
+            .with_context(|| format!("failed to append {}", source.display()))?;
+    } else {
+        bail!(
+            "cached output {} has unsupported file type",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn portable_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+#[cfg(not(unix))]
+fn portable_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o644
 }
 
 fn relative_path_between(from: &Path, to: &Path) -> Result<PathBuf> {
@@ -3244,6 +4268,58 @@ version = "0.1.0"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn exports_and_imports_validated_remote_bundle() {
+        let test_workspace = TestWorkspace::new("gomo-cache-bundle-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
+        test_workspace.write_file(
+            "libs/shared/test/main_test.gleam",
+            "pub fn value_test() { Nil }\n",
+        );
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let shared = project(&workspace, "shared");
+        let task_hash = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Test,
+            GLEAM_VERSION,
+        )
+        .expect("hash should compute");
+        store_successful_test(
+            &workspace,
+            shared,
+            &task_hash,
+            &TaskExecution::success("passed\n", ""),
+        )
+        .expect("entry should store");
+        let bundle = export_task_bundle(&workspace, &task_hash).expect("bundle should export");
+        let entry = task_cache_entry_dir(&workspace, &task_hash);
+        remove_path(&entry).expect("local entry should be removable");
+        import_task_bundle(
+            &workspace,
+            &task_hash,
+            &bundle.path,
+            &bundle.bundle_digest,
+            bundle.byte_len,
+            None,
+        )
+        .expect("bundle should import");
+        let restored = restore_successful_test(&workspace, &task_hash)
+            .expect("restore should succeed")
+            .expect("import should populate local cache");
+        assert_eq!(restored.stdout, "passed\n");
+        fs::remove_file(bundle.path).expect("bundle should be removable");
     }
 
     #[test]

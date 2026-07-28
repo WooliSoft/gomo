@@ -1,0 +1,8 @@
+[package]
+name = "gomo-cache-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Versioned wire types for Gomo's authenticated remote cache"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }

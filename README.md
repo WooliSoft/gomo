@@ -266,14 +266,76 @@ directories without `.` or `..`, and symlinks are not supported within them.
 Useful cache controls:
 
 ```sh
+gomo --cache-mode read-write test
+gomo --cache-mode read test
+gomo --no-remote-cache build
+gomo --remote-cache-read-only test
+gomo --require-remote-cache test
 gomo --no-cache build
 gomo --no-restore test
 gomo explain --target test --project web_app
 gomo reset --only-cache
 ```
 
-`reset --only-cache` removes the configured local cache directory. Cache pruning
-is intentionally deferred until the repo has a real retention policy.
+`off`, `read`, `write`, and `read-write` cache modes are also available through
+`GOMO_CACHE_MODE`. The local cache is always checked before a configured remote.
+`reset --only-cache` removes the configured local cache directory.
+
+### GitHub Actions snapshot cache
+
+Small projects can snapshot `.gomo/cache` with the supported
+`actions/cache/restore@v5` and `actions/cache/save@v5` actions. See
+[`examples/github-actions-cache.yml`](examples/github-actions-cache.yml). The
+save key is unique per job execution while the restore prefix is stable.
+Matrix dimensions that alter inputs or project selection must be included in
+both keys. Pull requests should restore without saving a trusted branch key.
+
+This snapshots the entire local cache, is branch-scoped and evictable by
+GitHub, and does not merge snapshots from parallel jobs. It is not the
+multi-user remote cache protocol and Gomo does not call GitHub's undocumented
+cache-service upload APIs.
+
+### Authenticated HTTP remote cache
+
+Configure a service without putting credentials in `gomo.toml`:
+
+```toml
+[cache.remote]
+backend = "http"
+url = "https://cache.example.internal"
+workspace = "wooli"
+mode = "auto"
+failure = "warn"
+max_concurrent_transfers = 4
+```
+
+Set `GOMO_REMOTE_CACHE_TOKEN` at runtime for static-token authentication.
+GitHub Actions jobs may instead grant `id-token: write`; when
+`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are
+available, Gomo requests and exchanges a GitHub OIDC JWT automatically. Set
+`GOMO_REMOTE_CACHE_OIDC_AUDIENCE` when the trust rule's audience differs from
+the service URL. No long-lived cache secret is needed in that mode.
+`GOMO_REMOTE_CACHE_URL`,
+`GOMO_REMOTE_CACHE_WORKSPACE`, `GOMO_REMOTE_CACHE_MODE`, and
+`GOMO_REMOTE_CACHE_RUN_ID` can override CI-specific settings. Tokens, S3
+credentials, and cached secret files must never be committed. Use a read-only
+identity for developers and untrusted CI; only protected CI should receive
+`cache:shared:write`. Release and deployment jobs that require fresh provenance
+should use `--no-remote-cache` and must not treat a cache hit as a deployable
+artifact attestation.
+
+The server is a separate binary:
+
+```sh
+gomo-cache-server migrate
+gomo-cache-server doctor
+gomo-cache-server serve
+```
+
+It uses PostgreSQL as the first-writer-wins publication authority and an
+S3-compatible bucket only for immutable bundle bytes. Garage is supported with
+region `garage`, a custom endpoint, and path-style addressing. Clients never
+receive bucket credentials.
 
 ## CI Workflows
 

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,8 @@ pub struct Workspace {
     pub cache_max_age_seconds: Option<u64>,
     /// Maximum local cache size. `None` disables size pruning.
     pub cache_max_size_bytes: Option<u64>,
+    /// Optional authenticated HTTP cache shared across machines.
+    pub remote_cache: Option<RemoteCacheConfig>,
     /// Configured project root globs, relative to the workspace root.
     pub project_globs: Vec<String>,
     /// Configured default concurrency for task-running commands.
@@ -44,6 +47,34 @@ pub struct Workspace {
     pub tasks: BTreeMap<String, Task>,
     /// Gleam projects discovered under the configured roots or referenced by local path dependencies.
     pub projects: Vec<Project>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteCacheMode {
+    Auto,
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteFailureMode {
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCacheConfig {
+    pub url: String,
+    pub workspace: String,
+    pub mode: RemoteCacheMode,
+    pub failure: RemoteFailureMode,
+    pub connect_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub shutdown_timeout_seconds: u64,
+    pub max_concurrent_transfers: usize,
+    pub max_entry_size_bytes: u64,
 }
 
 /// A Gleam package discovered in the workspace.
@@ -114,6 +145,7 @@ pub fn discover(root: impl AsRef<Path>) -> Result<Workspace> {
         cache_dir: config.cache_dir,
         cache_max_age_seconds: config.cache_max_age_seconds,
         cache_max_size_bytes: config.cache_max_size_bytes,
+        remote_cache: config.remote_cache,
         project_globs: config.project_globs,
         default_parallelism: config.default_parallelism,
         global_target_inputs: config.global_target_inputs,
@@ -232,6 +264,7 @@ fn validate_task_references(
                     task.name
                 );
             }
+            validate_dependency_cache_strategy(task, dependency, referenced)?;
         }
         validate_step_references(task, None, root_tasks, projects)?;
     }
@@ -253,11 +286,31 @@ fn validate_task_references(
                         task.name
                     );
                 }
+                validate_dependency_cache_strategy(task, dependency, referenced)?;
             }
             validate_step_references(task, Some(project), root_tasks, projects)?;
         }
     }
     reject_task_cycles(root_tasks, projects)?;
+    Ok(())
+}
+
+fn validate_dependency_cache_strategy(
+    task: &Task,
+    dependency: &str,
+    referenced: &Task,
+) -> Result<()> {
+    if task
+        .dependency_cache_strategies
+        .get(dependency)
+        .is_some_and(|strategy| *strategy == crate::task::DependencyCacheStrategy::Outputs)
+        && referenced.outputs.is_empty()
+    {
+        bail!(
+            "task `{}` uses the `outputs` cache strategy for `{dependency}`, but that task declares no outputs",
+            task.name
+        );
+    }
     Ok(())
 }
 
@@ -514,6 +567,29 @@ struct RawCacheConfig {
     dir: Option<String>,
     max_age_days: Option<u64>,
     max_size_bytes: Option<u64>,
+    remote: Option<RawRemoteCacheConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemoteCacheConfig {
+    backend: String,
+    url: String,
+    workspace: String,
+    #[serde(default = "default_remote_mode")]
+    mode: RemoteCacheMode,
+    #[serde(default = "default_remote_failure")]
+    failure: RemoteFailureMode,
+    #[serde(default = "default_connect_timeout")]
+    connect_timeout_seconds: u64,
+    #[serde(default = "default_request_timeout")]
+    request_timeout_seconds: u64,
+    #[serde(default = "default_shutdown_timeout")]
+    shutdown_timeout_seconds: u64,
+    #[serde(default = "default_max_concurrent_transfers")]
+    max_concurrent_transfers: usize,
+    #[serde(default = "default_max_remote_entry_size")]
+    max_entry_size_bytes: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -529,6 +605,7 @@ struct WorkspaceConfig {
     cache_dir: PathBuf,
     cache_max_age_seconds: Option<u64>,
     cache_max_size_bytes: Option<u64>,
+    remote_cache: Option<RemoteCacheConfig>,
     project_globs: Vec<String>,
     default_parallelism: DefaultParallelism,
     global_target_inputs: BTreeMap<String, Vec<String>>,
@@ -547,29 +624,26 @@ fn parse_workspace_config(root: &Path) -> Result<WorkspaceConfig> {
         RawGomoConfig::default()
     };
 
-    let cache_dir = raw_config
-        .cache
-        .dir
-        .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
+    let RawCacheConfig {
+        dir,
+        max_age_days,
+        max_size_bytes,
+        remote,
+    } = raw_config.cache;
+    let cache_dir = dir.unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
     let cache_dir = PathBuf::from(cache_dir);
     let cache_dir = if cache_dir.is_absolute() {
         cache_dir
     } else {
         root.join(cache_dir)
     };
-    let cache_max_age_seconds = raw_config
-        .cache
-        .max_age_days
+    let cache_max_age_seconds = max_age_days
         .unwrap_or(DEFAULT_CACHE_MAX_AGE_DAYS)
         .checked_mul(24 * 60 * 60)
         .filter(|seconds| *seconds > 0);
-    let cache_max_size_bytes = Some(
-        raw_config
-            .cache
-            .max_size_bytes
-            .unwrap_or(DEFAULT_CACHE_MAX_SIZE_BYTES),
-    )
-    .filter(|bytes| *bytes > 0);
+    let cache_max_size_bytes =
+        Some(max_size_bytes.unwrap_or(DEFAULT_CACHE_MAX_SIZE_BYTES)).filter(|bytes| *bytes > 0);
+    let remote_cache = normalize_remote_cache(remote)?;
 
     let RawWorkspaceConfig {
         project_roots,
@@ -585,12 +659,155 @@ fn parse_workspace_config(root: &Path) -> Result<WorkspaceConfig> {
         cache_dir,
         cache_max_age_seconds,
         cache_max_size_bytes,
+        remote_cache,
         project_globs,
         default_parallelism,
         global_target_inputs: collect_workspace_target_inputs(build, format, test),
         dependency_versions: normalize_dependency_version_config(raw_config.dependency_versions)?,
         tasks: raw_config.tasks,
     })
+}
+
+fn normalize_remote_cache(raw: Option<RawRemoteCacheConfig>) -> Result<Option<RemoteCacheConfig>> {
+    let environment_url = env::var("GOMO_REMOTE_CACHE_URL").ok();
+    let environment_workspace = env::var("GOMO_REMOTE_CACHE_WORKSPACE").ok();
+    let environment_mode = env::var("GOMO_REMOTE_CACHE_MODE").ok();
+    if raw.is_none() && environment_url.is_none() && environment_workspace.is_none() {
+        return Ok(None);
+    }
+
+    let (
+        backend,
+        mut url,
+        mut workspace,
+        mut mode,
+        failure,
+        connect_timeout_seconds,
+        request_timeout_seconds,
+        shutdown_timeout_seconds,
+        max_concurrent_transfers,
+        max_entry_size_bytes,
+    ) = match raw {
+        Some(raw) => (
+            raw.backend,
+            raw.url,
+            raw.workspace,
+            raw.mode,
+            raw.failure,
+            raw.connect_timeout_seconds,
+            raw.request_timeout_seconds,
+            raw.shutdown_timeout_seconds,
+            raw.max_concurrent_transfers,
+            raw.max_entry_size_bytes,
+        ),
+        None => (
+            "http".to_string(),
+            String::new(),
+            String::new(),
+            default_remote_mode(),
+            default_remote_failure(),
+            default_connect_timeout(),
+            default_request_timeout(),
+            default_shutdown_timeout(),
+            default_max_concurrent_transfers(),
+            default_max_remote_entry_size(),
+        ),
+    };
+    if backend != "http" {
+        bail!("cache.remote.backend must be `http`, got `{backend}`");
+    }
+    if let Some(value) = environment_url {
+        url = value;
+    }
+    if let Some(value) = environment_workspace {
+        workspace = value;
+    }
+    if let Some(value) = environment_mode {
+        mode = match value.as_str() {
+            "auto" => RemoteCacheMode::Auto,
+            "read-only" => RemoteCacheMode::ReadOnly,
+            "read-write" => RemoteCacheMode::ReadWrite,
+            _ => bail!("GOMO_REMOTE_CACHE_MODE must be `auto`, `read-only`, or `read-write`"),
+        };
+    }
+    url = url.trim_end_matches('/').trim().to_string();
+    workspace = workspace.trim().to_string();
+    if url.is_empty() || workspace.is_empty() {
+        bail!("remote cache URL and workspace must both be configured");
+    }
+    validate_remote_cache_url(&url)?;
+    if max_concurrent_transfers == 0 {
+        bail!("cache.remote.max_concurrent_transfers must be greater than zero");
+    }
+    if max_entry_size_bytes == 0 {
+        bail!("cache.remote.max_entry_size_bytes must be greater than zero");
+    }
+    Ok(Some(RemoteCacheConfig {
+        url,
+        workspace,
+        mode,
+        failure,
+        connect_timeout_seconds,
+        request_timeout_seconds,
+        shutdown_timeout_seconds,
+        max_concurrent_transfers,
+        max_entry_size_bytes,
+    }))
+}
+
+fn validate_remote_cache_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).context("cache.remote.url is not a valid URL")?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed
+                .host_str()
+                .context("cache.remote.url must include a hostname")?;
+            // url::Url serializes IPv6 host_str with brackets; strip them before parsing.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            if loopback {
+                Ok(())
+            } else {
+                bail!("cache.remote.url must use HTTPS (plain HTTP is allowed only for loopback)")
+            }
+        }
+        scheme => bail!("cache.remote.url must use HTTPS (got `{scheme}`)"),
+    }
+}
+
+fn default_remote_mode() -> RemoteCacheMode {
+    RemoteCacheMode::Auto
+}
+
+fn default_remote_failure() -> RemoteFailureMode {
+    RemoteFailureMode::Warn
+}
+
+fn default_connect_timeout() -> u64 {
+    5
+}
+
+fn default_request_timeout() -> u64 {
+    300
+}
+
+fn default_shutdown_timeout() -> u64 {
+    30
+}
+
+fn default_max_concurrent_transfers() -> usize {
+    4
+}
+
+fn default_max_remote_entry_size() -> u64 {
+    10 * 1024 * 1024 * 1024
 }
 
 fn normalize_dependency_version_config(
@@ -1322,5 +1539,64 @@ extends = "pong"
 
         let error = discover(test_workspace.path()).expect_err("cross-project cycles should fail");
         assert!(error.to_string().contains("task cycle:"));
+    }
+
+    #[test]
+    fn parses_secure_remote_cache_and_rich_task_contracts() {
+        let test_workspace = TestWorkspace::new("gomo-remote-config");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[cache.remote]
+backend = "http"
+url = "http://127.0.0.1:7788/"
+workspace = "example"
+mode = "read-only"
+failure = "error"
+
+[tasks.generate]
+cache = true
+remote_cache = false
+inputs = [{ glob = "fixtures/**", optional = true }]
+outputs = ["generated"]
+tools = [{ program = "node", args = ["--version"], optional = true }]
+steps = [{ exec = { program = "true" } }]
+
+[tasks.consume]
+cache = true
+depends_on = [{ task = "generate", cache_strategy = "outputs" }]
+steps = [{ exec = { program = "true" } }]
+"#,
+        );
+        let workspace = discover(test_workspace.path()).expect("config should parse");
+        let remote = workspace.remote_cache.expect("remote should be configured");
+        assert_eq!(remote.url, "http://127.0.0.1:7788");
+        assert_eq!(remote.workspace, "example");
+        assert_eq!(remote.mode, RemoteCacheMode::ReadOnly);
+        assert_eq!(remote.failure, RemoteFailureMode::Error);
+        let task = workspace.tasks.get("generate").expect("task should exist");
+        assert!(!task.remote_cache);
+        assert!(task.inputs[0].optional());
+        assert_eq!(task.tools[0].program, "node");
+    }
+
+    #[test]
+    fn rejects_http_hostname_prefix_loopback_bypasses() {
+        for url in [
+            "http://127.0.0.1.evil",
+            "http://127.0.0.1@evil.example",
+            "http://localhost.evil",
+        ] {
+            let error = validate_remote_cache_url(url)
+                .expect_err("prefix lookalikes must not count as loopback");
+            assert!(
+                error.to_string().contains("HTTPS"),
+                "unexpected error for {url}: {error}"
+            );
+        }
+        validate_remote_cache_url("http://127.0.0.1:7788").expect("loopback IPv4 HTTP is allowed");
+        validate_remote_cache_url("http://localhost:7788").expect("localhost HTTP is allowed");
+        validate_remote_cache_url("http://[::1]:7788").expect("loopback IPv6 HTTP is allowed");
+        validate_remote_cache_url("https://cache.example").expect("HTTPS is allowed");
     }
 }

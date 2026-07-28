@@ -8,6 +8,7 @@ mod dependency_versions;
 mod gleam_lock;
 mod gleam_toml;
 mod graph;
+mod remote_cache;
 mod runner;
 mod task;
 #[cfg(test)]
