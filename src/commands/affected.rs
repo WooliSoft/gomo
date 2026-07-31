@@ -37,7 +37,7 @@ pub(crate) fn run(
 fn run_with_runner_and_cache(
     cwd: &Path,
     request: AffectedRequest,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     output_options: OutputOptions,
 ) -> Result<CommandOutput> {

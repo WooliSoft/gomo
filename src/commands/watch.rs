@@ -161,9 +161,9 @@ pub(crate) fn run(
                 drop(wx);
                 input_task.abort();
                 let worker_result = worker.await.context("gomo watch worker failed")?;
-                if let Err(error) = watcher_result.context("Watchexec failed") {
-                    return Err(error.into());
-                }
+                watcher_result
+                    .context("Watchexec failed")?
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
                 worker_result
             }
             input_result = &mut input_task => {
@@ -178,6 +178,7 @@ pub(crate) fn run(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn animate_watcher_startup(
     interactive: bool,
     mut watcher_ready: tokio::sync::watch::Receiver<()>,
@@ -336,6 +337,7 @@ impl Drop for WatchTerminal {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     cwd: &Path,
     request: WatchRequest,
@@ -581,6 +583,7 @@ fn refresh_workspace(
     Ok((workspace, graph, selected, permitted))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cycle(
     workspace: &Workspace,
     graph: &ProjectGraph,

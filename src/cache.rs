@@ -998,15 +998,13 @@ fn directory_byte_len(path: &Path) -> Result<u64> {
 
 fn cache_entry_created_at(entry_dir: &Path) -> Result<u64> {
     let metadata_path = entry_dir.join("meta.json");
-    if let Ok(metadata_text) = fs::read_to_string(&metadata_path) {
-        if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_text) {
-            if let Some(created_at) = metadata
-                .get("created_at_unix_seconds")
-                .and_then(serde_json::Value::as_u64)
-            {
-                return Ok(created_at);
-            }
-        }
+    if let Ok(metadata_text) = fs::read_to_string(&metadata_path)
+        && let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_text)
+        && let Some(created_at) = metadata
+            .get("created_at_unix_seconds")
+            .and_then(serde_json::Value::as_u64)
+    {
+        return Ok(created_at);
     }
 
     path_modified_unix_seconds(entry_dir)
@@ -1049,13 +1047,13 @@ fn validate_cache_reset_path(workspace: &Workspace) -> Result<()> {
         .root
         .canonicalize()
         .unwrap_or(workspace.root.clone());
-    if let Ok(cache_dir) = workspace.cache_dir.canonicalize() {
-        if cache_dir == workspace_root || cache_dir.parent().is_none() {
-            bail!(
-                "refusing to remove unsafe cache directory {}",
-                workspace.cache_dir.display()
-            );
-        }
+    if let Ok(cache_dir) = workspace.cache_dir.canonicalize()
+        && (cache_dir == workspace_root || cache_dir.parent().is_none())
+    {
+        bail!(
+            "refusing to remove unsafe cache directory {}",
+            workspace.cache_dir.display()
+        );
     }
 
     Ok(())
@@ -2551,7 +2549,7 @@ fn write_build_outputs_archive(
             entries.push((entry.into_path(), Path::new(folder).join(relative)));
         }
     }
-    entries.sort_by(|left, right| normalize_path(&left.1).cmp(&normalize_path(&right.1)));
+    entries.sort_by_key(|entry| normalize_path(&entry.1));
     for (source, archive_path) in entries {
         append_deterministic_output(&mut archive, &source, &archive_path, &cached_output_dirs)?;
     }
@@ -2598,7 +2596,7 @@ pub(crate) fn write_workspace_outputs_archive(
             entries.push((output.clone(), relative));
         }
     }
-    entries.sort_by(|left, right| normalize_path(&left.1).cmp(&normalize_path(&right.1)));
+    entries.sort_by_key(|entry| normalize_path(&entry.1));
     for (source, path) in entries {
         append_deterministic_output(&mut archive, &source, &path, &output_roots)?;
     }

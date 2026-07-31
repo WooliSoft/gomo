@@ -353,20 +353,18 @@ impl Task {
                 self.name
             );
         }
-        if self.mode == TaskMode::Sequential {
-            if let Some((index, _)) = self
+        if self.mode == TaskMode::Sequential
+            && let Some((index, _)) = self
                 .steps
                 .iter()
                 .enumerate()
                 .find(|(_, step)| step.is_automatically_persistent())
-            {
-                if index + 1 != self.steps.len() {
-                    bail!(
-                        "task `{}` has a dev or watch action before the final step; automatically persistent steps must be last in sequential tasks",
-                        self.name
-                    );
-                }
-            }
+            && index + 1 != self.steps.len()
+        {
+            bail!(
+                "task `{}` has a dev or watch action before the final step; automatically persistent steps must be last in sequential tasks",
+                self.name
+            );
         }
         for input in &self.inputs {
             validate_declared_path(&self.name, input.glob())?;

@@ -323,8 +323,8 @@ fn render_values(output: &mut String, values: &[String]) {
 
 fn render_task(output: &mut String, task: &Task) {
     let description = task.description.as_deref().unwrap_or("");
-    let cached = task.cache.then_some("  cached").unwrap_or("");
-    let persistent = task.persistent.then_some("  persistent").unwrap_or("");
+    let cached = if task.cache { "  cached" } else { "" };
+    let persistent = if task.persistent { "  persistent" } else { "" };
     output.push_str(&format!(
         "  {:<20} {}{}{}\n",
         task.name, description, cached, persistent
@@ -854,6 +854,7 @@ fn run_shell(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_process(
     workspace: &Workspace,
     owner: &Task,

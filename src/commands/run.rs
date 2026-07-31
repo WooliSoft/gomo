@@ -82,17 +82,12 @@ impl CacheOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Parallelism {
+    #[default]
     WorkspaceDefault,
     Auto,
     Fixed(usize),
-}
-
-impl Default for Parallelism {
-    fn default() -> Self {
-        Self::WorkspaceDefault
-    }
 }
 
 impl Parallelism {
@@ -239,7 +234,7 @@ pub(crate) fn run_with_runner(
 fn run_with_runner_and_cache(
     cwd: &Path,
     request: RunRequest,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     output_options: OutputOptions,
 ) -> Result<CommandOutput> {
@@ -300,18 +295,16 @@ fn run_with_runner_and_cache(
                     );
                 }
                 super::task::push_target_task_stack(target_key.clone());
-                let task_result = (|| {
-                    super::task::run(
-                        cwd,
-                        super::task::TaskRunRequest {
-                            name: task_name.clone(),
-                            project: Some(project_name.clone()),
-                            parallelism: request.parallelism,
-                        },
-                        cache_options,
-                        output_options,
-                    )
-                })();
+                let task_result = super::task::run(
+                    cwd,
+                    super::task::TaskRunRequest {
+                        name: task_name.clone(),
+                        project: Some(project_name.clone()),
+                        parallelism: request.parallelism,
+                    },
+                    cache_options,
+                    output_options,
+                );
                 super::task::pop_target_task_stack();
                 output.push_str(
                     &task_result
@@ -344,13 +337,14 @@ fn run_with_runner_and_cache(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_project_names(
     workspace: &Workspace,
     graph: &ProjectGraph,
     project_names: &[String],
     target: Target,
     command_options: CommandOptions,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     parallelism: Parallelism,
     output_options: OutputOptions,
@@ -370,13 +364,14 @@ pub(crate) fn run_project_names(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_project_names_with_control(
     workspace: &Workspace,
     graph: &ProjectGraph,
     project_names: &[String],
     target: Target,
     command_options: CommandOptions,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     parallelism: Parallelism,
     output_options: OutputOptions,
@@ -397,13 +392,14 @@ pub(crate) fn run_project_names_with_control(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_project_names_with_cancellation(
     workspace: &Workspace,
     graph: &ProjectGraph,
     project_names: &[String],
     target: Target,
     command_options: CommandOptions,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     parallelism: Parallelism,
     output_options: OutputOptions,
@@ -424,13 +420,14 @@ pub(crate) fn run_project_names_with_cancellation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_project_names_with_optional_control(
     workspace: &Workspace,
     graph: &ProjectGraph,
     project_names: &[String],
     target: Target,
     command_options: CommandOptions,
-    runner: &(impl CommandRunner + Sync),
+    runner: &impl CommandRunner,
     cache_options: CacheOptions,
     parallelism: Parallelism,
     output_options: OutputOptions,
@@ -582,6 +579,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_tasks_with_hasher_and_control<R, H>(
     workspace: &Workspace,
     graph: &ProjectGraph,
@@ -658,14 +656,14 @@ where
                 let progress_sender = sender.clone();
                 let task_cancellation = &cancellation;
 
-                if let Some(terminal) = terminal.as_mut() {
-                    if let Err(error) = terminal.task_started(&started_project) {
-                        if first_error.is_none() {
-                            first_error = Some(error.into());
-                        }
-                        stop_scheduling = true;
-                        break;
+                if let Some(terminal) = terminal.as_mut()
+                    && let Err(error) = terminal.task_started(&started_project)
+                {
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
                     }
+                    stop_scheduling = true;
+                    break;
                 }
                 scope.spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -763,21 +761,20 @@ where
 
             match task_result.result {
                 Ok(completed) => {
-                    if let Some(terminal) = terminal.as_mut() {
-                        if let Err(error) =
+                    if let Some(terminal) = terminal.as_mut()
+                        && let Err(error) =
                             terminal.task_completed(&completed.outcome, &completed.output)
-                        {
-                            if first_error.is_none() {
-                                first_error = Some(error.into());
-                            }
-                            stop_scheduling = true;
+                    {
+                        if first_error.is_none() {
+                            first_error = Some(error.into());
                         }
+                        stop_scheduling = true;
                     }
                     let task_succeeded = completed.outcome.status == TaskStatus::Succeeded;
-                    if let TaskStatus::Failed(task_exit_code) = &completed.outcome.status {
-                        if exit_code == 0 {
-                            exit_code = *task_exit_code;
-                        }
+                    if let TaskStatus::Failed(task_exit_code) = &completed.outcome.status
+                        && exit_code == 0
+                    {
+                        exit_code = *task_exit_code;
                     }
 
                     task_outputs.insert(task_result.project.clone(), completed.output);
@@ -1014,6 +1011,7 @@ fn insert_ready_task(ready: &mut Vec<String>, project: String, order: &BTreeMap<
     ready.sort_by_key(|project| order.get(project).copied().unwrap_or(usize::MAX));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_single_task<R, H>(
     workspace: &Workspace,
     graph: &ProjectGraph,

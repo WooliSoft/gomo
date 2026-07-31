@@ -390,11 +390,11 @@ impl RunManyTerminal {
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        if let Some(mut terminal) = self.terminal.take() {
-            if !self.is_continuous() {
-                execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
-                terminal.show_cursor()?;
-            }
+        if let Some(mut terminal) = self.terminal.take()
+            && !self.is_continuous()
+        {
+            execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
+            terminal.show_cursor()?;
         }
         if self.raw_mode_enabled {
             disable_raw_mode()?;
@@ -482,10 +482,8 @@ impl RunManyTerminal {
                 }
             }
             KeyCode::Home => self.selected_index = 0,
-            KeyCode::End => {
-                if !self.project_names.is_empty() {
-                    self.selected_index = self.project_names.len() - 1;
-                }
+            KeyCode::End if !self.project_names.is_empty() => {
+                self.selected_index = self.project_names.len() - 1;
             }
             _ => {}
         }

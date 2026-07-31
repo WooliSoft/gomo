@@ -188,6 +188,7 @@ async fn run_async(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_batch(
     cwd: &Path,
     request: &DevRequest,
