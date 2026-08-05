@@ -366,6 +366,10 @@ identity for developers and untrusted CI; only protected CI should receive
 should use `--no-remote-cache` and must not treat a cache hit as a deployable
 artifact attestation.
 
+HTTPS uses the platform certificate store. Install an internal cache service's
+root CA in the operating system trust store instead of disabling certificate
+validation.
+
 The server is a separate binary:
 
 ```sh
