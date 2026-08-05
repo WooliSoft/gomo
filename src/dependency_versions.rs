@@ -184,7 +184,7 @@ pub(crate) fn check_workspace(
 }
 
 fn is_git_package(package: &LockedPackage) -> bool {
-    package.source.as_str() == "git"
+    package.source == LockedPackageSource::Git
 }
 
 fn should_skip_package(package: &LockedPackage, config: &DependencyVersionConfig) -> bool {

@@ -134,6 +134,7 @@ For workspace inspection and troubleshooting:
 ```sh
 gomo doctor
 gomo deps check
+gomo deps vendor
 gomo projects
 gomo graph
 ```
@@ -186,12 +187,18 @@ default_parallelism = "auto"
 enabled = true
 include_local = true
 ignore = []
+
+# Optional strict vendoring
+[vendoring]
+dir = "vendor"
 ```
 
 `project_roots` supports exact paths and direct-child globs like `apps/*`.
 Unknown config fields are rejected so typos do not silently change behavior.
 `dependency_versions` is optional. When present, `enabled` defaults to `true`,
 `include_local` defaults to `true`, and `ignore` defaults to an empty list.
+`[vendoring]` is optional; omit it unless the workspace wants locked external
+packages checked into a vendor store.
 
 Project-level target config lives in each package's `gleam.toml` under
 `[tools.gomo.<target>]`. `inputs` override the files used for cache keys and
@@ -237,7 +244,9 @@ gomo deps check --json
 For Hex packages, the same dependency name must resolve to one version across
 all checked manifests. Git packages must resolve to the same version, repository
 URL, and commit. For local packages, Gomo also verifies that the locked local
-version matches the referenced local package's `gleam.toml` version.
+version matches the referenced local package's `gleam.toml` version. When
+`[vendoring]` is configured, the same command also validates the vendor store
+(see [Dependency Vendoring](#dependency-vendoring)).
 
 Automatic `doctor` enforcement is controlled from root `gomo.toml`:
 
@@ -252,6 +261,39 @@ If the table is absent, `gomo deps check` still works explicitly, but
 `gomo doctor` skips dependency version policy checks. Set `enabled = false` to
 keep the table's `include_local` or `ignore` settings for explicit checks while
 leaving `doctor` unchanged.
+
+## Dependency Vendoring
+
+Add an optional root `[vendoring]` table to enable strict dependency vendoring.
+`dir` defaults to `vendor`:
+
+```toml
+[vendoring]
+dir = "vendor"
+```
+
+`gomo deps vendor` synchronizes exact Hex and Git packages from checked-in
+`manifest.toml` locks into `gomo-vendor.toml`, `hex`, and `git` under the
+configured vendor directory. The directory is `vendor` when `dir` is omitted.
+Set `HEXPM_READ_API_KEY` when private Hex packages need a read token.
+
+```sh
+gomo deps vendor
+gomo deps check
+```
+
+With vendoring enabled, `gomo deps check` validates resolved versions plus
+vendor inventory, archive checksums, and project snapshots. `gomo doctor`
+reports vendoring issues when the table is present.
+
+Build, test, dev, watch, tasks bound to build/test targets, and structured
+`module`/`target` steps launched through Gomo fail closed when vendor state is
+missing or stale. Raw `gleam` invocations and standalone arbitrary `shell`/`exec`
+task steps are outside that guarantee.
+
+`gomo clean` removes project build output but not vendor files. The next Gomo
+command that prepares projects hydrates Hex archives into Gleam's checksum cache
+and restores Git package freshness state under each project's `build/packages`.
 
 ## Cache
 
@@ -369,6 +411,7 @@ Common fixes:
 - Missing workspace: run from inside a repo containing root `gomo.toml`.
 - Unknown project: check `gomo projects` for discovered package names.
 - Invalid graph: check local path dependencies in each package's `gleam.toml`.
+- Stale or missing vendor store: run `gomo deps check`, then `gomo deps vendor`.
 - Cache confusion: run `gomo explain --target <build|test> --project <name>` to inspect cache inputs, or `gomo reset --only-cache` to remove local entries.
 
 ## License

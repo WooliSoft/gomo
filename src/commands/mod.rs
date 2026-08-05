@@ -11,6 +11,7 @@ pub(crate) mod projects;
 pub(crate) mod reset;
 pub(crate) mod run;
 pub(crate) mod task;
+pub(crate) mod vendor;
 pub(crate) mod watch;
 pub(crate) mod watch_support;
 

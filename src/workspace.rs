@@ -13,6 +13,7 @@ const CONFIG_FILE_NAME: &str = "gomo.toml";
 const DEFAULT_CACHE_DIR: &str = ".gomo/cache";
 const DEFAULT_CACHE_MAX_AGE_DAYS: u64 = 30;
 const DEFAULT_CACHE_MAX_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const DEFAULT_VENDOR_DIR: &str = "vendor";
 const DEFAULT_PROJECT_GLOBS: &[&str] = &["apps/*", "libs/*", "services/*"];
 
 /// Configured default concurrency for task-running commands.
@@ -20,6 +21,13 @@ const DEFAULT_PROJECT_GLOBS: &[&str] = &["apps/*", "libs/*", "services/*"];
 pub enum DefaultParallelism {
     Auto,
     Fixed(usize),
+}
+
+/// Workspace vendoring configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendoringConfig {
+    /// Absolute directory used for vendored packages.
+    pub dir: PathBuf,
 }
 
 /// A discovered Gomo workspace.
@@ -35,6 +43,8 @@ pub struct Workspace {
     pub cache_max_size_bytes: Option<u64>,
     /// Optional authenticated HTTP cache shared across machines.
     pub remote_cache: Option<RemoteCacheConfig>,
+    /// Optional package vendoring configuration.
+    pub vendoring: Option<VendoringConfig>,
     /// Configured project root globs, relative to the workspace root.
     pub project_globs: Vec<String>,
     /// Configured default concurrency for task-running commands.
@@ -146,6 +156,7 @@ pub fn discover(root: impl AsRef<Path>) -> Result<Workspace> {
         cache_max_age_seconds: config.cache_max_age_seconds,
         cache_max_size_bytes: config.cache_max_size_bytes,
         remote_cache: config.remote_cache,
+        vendoring: config.vendoring,
         project_globs: config.project_globs,
         default_parallelism: config.default_parallelism,
         global_target_inputs: config.global_target_inputs,
@@ -523,6 +534,8 @@ struct RawGomoConfig {
     #[serde(default)]
     cache: RawCacheConfig,
     #[serde(default)]
+    vendoring: Option<RawVendoringConfig>,
+    #[serde(default)]
     dependency_versions: Option<RawDependencyVersionConfig>,
     #[serde(default)]
     tasks: BTreeMap<String, TaskDefinition>,
@@ -594,6 +607,12 @@ struct RawRemoteCacheConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawVendoringConfig {
+    dir: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDependencyVersionConfig {
     enabled: Option<bool>,
     include_local: Option<bool>,
@@ -606,6 +625,7 @@ struct WorkspaceConfig {
     cache_max_age_seconds: Option<u64>,
     cache_max_size_bytes: Option<u64>,
     remote_cache: Option<RemoteCacheConfig>,
+    vendoring: Option<VendoringConfig>,
     project_globs: Vec<String>,
     default_parallelism: DefaultParallelism,
     global_target_inputs: BTreeMap<String, Vec<String>>,
@@ -654,18 +674,83 @@ fn parse_workspace_config(root: &Path) -> Result<WorkspaceConfig> {
     } = raw_config.workspace;
     let project_globs = normalize_project_globs(project_roots)?;
     let default_parallelism = parse_default_parallelism(&default_parallelism)?;
+    let vendoring = normalize_vendoring_config(root, &cache_dir, raw_config.vendoring)?;
 
     Ok(WorkspaceConfig {
         cache_dir,
         cache_max_age_seconds,
         cache_max_size_bytes,
         remote_cache,
+        vendoring,
         project_globs,
         default_parallelism,
         global_target_inputs: collect_workspace_target_inputs(build, format, test),
         dependency_versions: normalize_dependency_version_config(raw_config.dependency_versions)?,
         tasks: raw_config.tasks,
     })
+}
+
+fn normalize_vendoring_config(
+    root: &Path,
+    cache_dir: &Path,
+    config: Option<RawVendoringConfig>,
+) -> Result<Option<VendoringConfig>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let dir = config.dir.unwrap_or_else(|| DEFAULT_VENDOR_DIR.to_string());
+    let dir = dir.trim();
+    if dir.is_empty() {
+        bail!("vendoring.dir must not be empty");
+    }
+
+    let path = Path::new(dir);
+    if path.is_absolute() {
+        bail!("vendoring.dir must be relative to the workspace root");
+    }
+
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                bail!("vendoring.dir must not leave the workspace root");
+            }
+            std::path::Component::Normal(_) => {
+                has_normal_component = true;
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("vendoring.dir must be relative to the workspace root");
+            }
+        }
+    }
+    if !has_normal_component {
+        bail!("vendoring.dir must not be the workspace root");
+    }
+
+    let dir = lexically_normalized(&root.join(path));
+    if paths_overlap(&dir, cache_dir) {
+        bail!(
+            "vendoring.dir `{}` overlaps the configured cache directory `{}`",
+            dir.display(),
+            cache_dir.display()
+        );
+    }
+
+    Ok(Some(VendoringConfig { dir }))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = lexically_normalized(left);
+    let right = lexically_normalized(right);
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+fn lexically_normalized(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 fn normalize_remote_cache(raw: Option<RawRemoteCacheConfig>) -> Result<Option<RemoteCacheConfig>> {
@@ -1204,8 +1289,7 @@ version = "0.1.0"
                 .any(|project| project.name == "demo")
         );
         assert!(workspace.projects.iter().any(|project| {
-            project.name == "esgleam"
-                && project.root_relative_path == PathBuf::from("tools/esgleam")
+            project.name == "esgleam" && project.root_relative_path == Path::new("tools/esgleam")
         }));
     }
 
@@ -1340,6 +1424,234 @@ version = "0.1.0"
         let workspace = discover(test_workspace.path()).expect("workspace should be discovered");
 
         assert_eq!(workspace.default_parallelism, DefaultParallelism::Fixed(4));
+    }
+
+    #[test]
+    fn absent_vendoring_config_is_none() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+"#,
+        );
+
+        let workspace = discover(test_workspace.path()).expect("workspace should be discovered");
+
+        assert_eq!(workspace.vendoring, None);
+    }
+
+    #[test]
+    fn empty_vendoring_table_defaults_to_vendor_dir() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[vendoring]
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+"#,
+        );
+
+        let workspace = discover(test_workspace.path()).expect("workspace should be discovered");
+
+        assert_eq!(
+            workspace.vendoring,
+            Some(VendoringConfig {
+                dir: workspace.root.join("vendor"),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_custom_vendoring_dir_from_gomo_config() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[vendoring]
+dir = "third_party/gleam"
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+"#,
+        );
+
+        let workspace = discover(test_workspace.path()).expect("workspace should be discovered");
+
+        assert_eq!(
+            workspace.vendoring,
+            Some(VendoringConfig {
+                dir: workspace.root.join("third_party/gleam"),
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_leading_current_dir_in_vendoring_dir() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file("gomo.toml", "[vendoring]\ndir = \"./third_party\"\n");
+
+        let workspace = discover(test_workspace.path()).expect("workspace should be discovered");
+
+        assert_eq!(
+            workspace.vendoring,
+            Some(VendoringConfig {
+                dir: workspace.root.join("third_party"),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_vendoring_dirs() {
+        for (dir, expected) in [
+            ("", "vendoring.dir must not be empty"),
+            (
+                "/tmp/vendor",
+                "vendoring.dir must be relative to the workspace root",
+            ),
+            (".", "vendoring.dir must not be the workspace root"),
+            (
+                "../vendor",
+                "vendoring.dir must not leave the workspace root",
+            ),
+            (
+                "foo/../..",
+                "vendoring.dir must not leave the workspace root",
+            ),
+        ] {
+            let test_workspace = TestWorkspace::new("gomo-workspace-test");
+            test_workspace.write_file(
+                "gomo.toml",
+                &format!(
+                    r#"
+[vendoring]
+dir = "{dir}"
+"#
+                ),
+            );
+
+            let error = discover(test_workspace.path()).expect_err("invalid vendoring should fail");
+
+            assert!(
+                error.to_string().contains(expected),
+                "dir `{dir}` error `{error}` should contain `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_vendoring_fields() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[vendoring]
+dir = "vendor"
+enabled = true
+"#,
+        );
+
+        let error =
+            discover(test_workspace.path()).expect_err("unknown vendoring field should fail");
+        let error_chain = format!("{error:#}");
+
+        assert!(error.to_string().contains("invalid TOML"));
+        assert!(error_chain.contains("unknown field"));
+        assert!(error_chain.contains("enabled"));
+    }
+
+    #[test]
+    fn rejects_vendoring_dir_overlapping_cache_dir() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[cache]
+dir = "tmp/cache"
+
+[vendoring]
+dir = "tmp/cache/packages"
+"#,
+        );
+
+        let error = discover(test_workspace.path()).expect_err("cache overlap should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps the configured cache directory")
+        );
+    }
+
+    #[test]
+    fn rejects_vendoring_dir_overlapping_unnormalized_cache_dir() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[cache]
+dir = "./tmp/cache"
+
+[vendoring]
+dir = "tmp/cache/packages"
+"#,
+        );
+
+        let error = discover(test_workspace.path()).expect_err("cache overlap should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps the configured cache directory")
+        );
+    }
+
+    #[test]
+    fn rejects_cache_dir_nested_under_vendoring_dir() {
+        let test_workspace = TestWorkspace::new("gomo-workspace-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[cache]
+dir = "deps/cache"
+
+[vendoring]
+dir = "deps"
+"#,
+        );
+
+        let error =
+            discover(test_workspace.path()).expect_err("cache nested under vendor should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps the configured cache directory")
+        );
     }
 
     #[test]

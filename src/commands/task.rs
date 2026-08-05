@@ -449,6 +449,7 @@ pub(crate) fn run_many(
 struct ExecutionState {
     completed: BTreeSet<String>,
     locks: BTreeMap<String, Arc<Mutex<()>>>,
+    project_preparation_locks: BTreeMap<String, Arc<Mutex<()>>>,
 }
 
 fn select_task<'a>(
@@ -763,6 +764,21 @@ fn execute_step(
     }
     if let Some(action) = &step.module {
         let project = find_project(workspace, &action.project)?;
+        let preparation_lock = {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("task completion state was poisoned"))?;
+            state
+                .project_preparation_locks
+                .entry(project.name.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let preparation_guard = preparation_lock
+            .lock()
+            .map_err(|_| anyhow!("project preparation lock was poisoned"))?;
+        crate::dependency_vendor::prepare_projects(workspace, std::slice::from_ref(&project.name))?;
+        drop(preparation_guard);
         let mut args = vec!["run".to_string(), "-m".to_string(), action.module.clone()];
         if !action.args.is_empty() {
             args.push("--".to_string());

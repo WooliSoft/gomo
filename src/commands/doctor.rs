@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::commands::{CommandOutput, OutputOptions};
+use crate::dependency_vendor;
 use crate::dependency_versions;
 use crate::graph::ProjectGraph;
 use crate::remote_cache::RemoteCacheClient;
@@ -81,9 +82,33 @@ fn diagnose(cwd: &Path) -> DoctorReport {
     check_remote_cache(&mut report, &workspace);
     check_graph(&mut report, &workspace);
     check_dependency_versions(&mut report, &workspace);
+    check_dependency_vendor(&mut report, &workspace);
     report.finish();
 
     report
+}
+
+fn check_dependency_vendor(report: &mut DoctorReport, workspace: &Workspace) {
+    let Some(vendor_report) = dependency_vendor::check_workspace(workspace) else {
+        return;
+    };
+    if vendor_report.is_success() {
+        report.ok(
+            "dependency vendor",
+            format!(
+                "validated {} vendored package(s) in {}",
+                vendor_report.checked_package_count, vendor_report.directory
+            ),
+        );
+    } else {
+        report.error(
+            "dependency vendor",
+            format!(
+                "found {} vendoring issue(s). Run `gomo deps check` for details.",
+                vendor_report.issue_count()
+            ),
+        );
+    }
 }
 
 fn check_remote_cache(report: &mut DoctorReport, workspace: &Workspace) {
@@ -612,6 +637,30 @@ version = "0.1.0"
 
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.contains("[error] dependency versions"));
+        assert!(output.stdout.contains("gomo deps check"));
+    }
+
+    #[test]
+    fn doctor_checks_configured_vendor_store() {
+        let test_workspace = TestWorkspace::new("gomo-doctor-command-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            "[workspace]\nproject_roots = [\"apps/*\"]\n\n[vendoring]\n",
+        );
+        test_workspace.write_manifest("apps/demo", "name = \"demo\"\nversion = \"0.1.0\"\n");
+        test_workspace.write_file("apps/demo/manifest.toml", "packages = []\n");
+
+        let output = run(
+            test_workspace.path(),
+            OutputOptions {
+                ci: true,
+                ..OutputOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.contains("[error] dependency vendor"));
         assert!(output.stdout.contains("gomo deps check"));
     }
 

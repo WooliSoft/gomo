@@ -242,7 +242,7 @@ fn run_with_runner_and_cache(
     let graph = ProjectGraph::build(&workspace)?;
     let project_names = selected_project_names(&workspace, &graph, &request)?;
 
-    if project_names.iter().any(|name| {
+    let has_bound_tasks = project_names.iter().any(|name| {
         workspace
             .projects
             .iter()
@@ -250,7 +250,12 @@ fn run_with_runner_and_cache(
             .and_then(|project| project.gomo_targets.get(request.target.as_str()))
             .and_then(|config| config.task.as_ref())
             .is_some()
-    }) {
+    });
+    if has_bound_tasks && matches!(request.target, Target::Build | Target::Test) {
+        crate::dependency_vendor::prepare_projects(&workspace, &project_names)?;
+    }
+
+    if has_bound_tasks {
         let mut output = String::new();
         let mut native_projects = Vec::new();
         let flush_native = |projects: &mut Vec<String>, output: &mut String| -> Result<()> {
@@ -258,7 +263,7 @@ fn run_with_runner_and_cache(
                 return Ok(());
             }
             output.push_str(
-                &run_project_names(
+                &run_project_names_with_optional_control(
                     &workspace,
                     &graph,
                     projects,
@@ -268,6 +273,9 @@ fn run_with_runner_and_cache(
                     cache_options,
                     request.parallelism,
                     output_options,
+                    CancellationToken::new(),
+                    None,
+                    false,
                 )?
                 .stdout,
             );
@@ -361,6 +369,7 @@ pub(crate) fn run_project_names(
         output_options,
         CancellationToken::new(),
         None,
+        true,
     )
 }
 
@@ -389,6 +398,7 @@ pub(crate) fn run_project_names_with_control(
         output_options,
         control.cancellation_token(),
         Some(control),
+        true,
     )
 }
 
@@ -417,6 +427,7 @@ pub(crate) fn run_project_names_with_cancellation(
         output_options,
         cancellation,
         None,
+        true,
     )
 }
 
@@ -433,7 +444,11 @@ fn run_project_names_with_optional_control(
     output_options: OutputOptions,
     cancellation: CancellationToken,
     control: Option<ui::run::RunManyControl>,
+    prepare_vendored_dependencies: bool,
 ) -> Result<CommandOutput> {
+    if prepare_vendored_dependencies && matches!(target, Target::Build | Target::Test) {
+        crate::dependency_vendor::prepare_projects(workspace, project_names)?;
+    }
     if !cache_options.no_cache {
         cache::prepare_cache(workspace)?;
     }
@@ -545,6 +560,7 @@ fn project_index(workspace: &Workspace) -> BTreeMap<&str, &Project> {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn execute_tasks_with_hasher<R, H>(
     workspace: &Workspace,
     graph: &ProjectGraph,
@@ -2698,5 +2714,59 @@ command = "mise exec -- gleam format --check"
 
         assert!(error.to_string().contains("unknown project `missing`"));
         assert!(error.to_string().contains("Known projects:"));
+    }
+
+    #[test]
+    fn prepares_vendored_dependencies_before_bound_build_tasks() {
+        let test_workspace = TestWorkspace::new("gomo-run-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[vendoring]
+
+[tasks.bound-build]
+scope = "project"
+steps = [{ shell = { command = "touch bound-task-ran" } }]
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+task = "bound-build"
+"#,
+        );
+        test_workspace.write_file("apps/demo/manifest.toml", "packages = []\n");
+
+        let error = run_with_runner(
+            test_workspace.path(),
+            RunRequest {
+                target: Target::Build,
+                command_options: CommandOptions::default(),
+                selection: ProjectSelection::Project("demo".to_string()),
+                with_deps: false,
+                parallelism: Parallelism::Fixed(1),
+            },
+            &FakeRunner::default(),
+        )
+        .expect_err("missing vendor inventory should fail before the bound task");
+
+        assert!(
+            error
+                .to_string()
+                .contains("vendored dependencies are incomplete or stale")
+        );
+        assert!(
+            !test_workspace
+                .path()
+                .join("apps/demo/bound-task-ran")
+                .exists()
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::commands::{CommandOutput, OutputOptions};
+use crate::dependency_vendor::{self, VendorCheckReport};
 use crate::dependency_versions::{self, DependencyVersionReport};
 use crate::workspace;
 
@@ -17,113 +18,167 @@ const DIM_GRAY: &str = "\x1b[2;90m";
 pub(crate) fn run(cwd: &Path, output_options: OutputOptions) -> Result<CommandOutput> {
     let workspace = workspace::discover_from(cwd)?;
     let report = dependency_versions::check_workspace(&workspace, &workspace.dependency_versions);
-    let exit_code = if report.is_success() { 0 } else { 1 };
+    let vendor_report = dependency_vendor::check_workspace(&workspace);
+    let is_success = combined_is_success(&report, vendor_report.as_ref());
+    let exit_code = if is_success { 0 } else { 1 };
     let output = if output_options.json {
-        render_json(&report)?
+        render_json(&report, vendor_report.as_ref())?
     } else if output_options.ci {
-        render_plain(&report)
+        render_plain(&report, vendor_report.as_ref())
     } else {
-        render_rich(&report, output_options.terminal_width)
+        render_rich(
+            &report,
+            vendor_report.as_ref(),
+            output_options.terminal_width,
+        )
     };
 
     Ok(CommandOutput::with_exit_code(output, exit_code))
 }
 
-fn render_json(report: &DependencyVersionReport) -> Result<String> {
-    let mut json = serde_json::to_string_pretty(report)
-        .context("failed to serialize dependency versions JSON")?;
+fn combined_is_success(
+    report: &DependencyVersionReport,
+    vendor_report: Option<&VendorCheckReport>,
+) -> bool {
+    report.is_success() && vendor_report.is_none_or(VendorCheckReport::is_success)
+}
+
+fn combined_status(
+    report: &DependencyVersionReport,
+    vendor_report: Option<&VendorCheckReport>,
+) -> &'static str {
+    if combined_is_success(report, vendor_report) {
+        "ok"
+    } else {
+        "error"
+    }
+}
+
+fn render_json(
+    report: &DependencyVersionReport,
+    vendor_report: Option<&VendorCheckReport>,
+) -> Result<String> {
+    let mut value =
+        serde_json::to_value(report).context("failed to serialize dependency versions JSON")?;
+    let object = value
+        .as_object_mut()
+        .context("dependency versions JSON must be an object")?;
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(combined_status(report, vendor_report).to_string()),
+    );
+    if let Some(vendor_report) = vendor_report {
+        object.insert(
+            "vendoring".to_string(),
+            serde_json::to_value(vendor_report)
+                .context("failed to serialize dependency vendor JSON")?,
+        );
+    }
+    let mut json = serde_json::to_string_pretty(&value)
+        .context("failed to serialize dependency check JSON")?;
     json.push('\n');
     Ok(json)
 }
 
-fn render_plain(report: &DependencyVersionReport) -> String {
+fn render_plain(
+    report: &DependencyVersionReport,
+    vendor_report: Option<&VendorCheckReport>,
+) -> String {
     let mut output = String::new();
     output.push_str("Dependency Versions\n");
-    output.push_str(&format!("Status: {}\n", report.status));
+    output.push_str(&format!(
+        "Status: {}\n",
+        combined_status(report, vendor_report)
+    ));
     output.push_str(&format!("Projects: {}\n", report.project_count));
     output.push_str(&format!("Manifests: {}\n", report.checked_manifest_count));
 
     if report.is_success() {
         output.push_str("[ok] all checked dependencies have consistent resolutions\n");
-        return output;
-    }
-
-    if !report.missing_manifests.is_empty() {
-        output.push_str("[error] missing manifest.toml files:\n");
-        for missing in &report.missing_manifests {
-            output.push_str(&format!("  - {}: {}\n", missing.project, missing.manifest));
-        }
-    }
-
-    if !report.manifest_errors.is_empty() {
-        output.push_str("[error] invalid manifest.toml files:\n");
-        for error in &report.manifest_errors {
-            output.push_str(&format!(
-                "  - {}: {} ({})\n",
-                error.project, error.manifest, error.message
-            ));
-        }
-    }
-
-    for mismatch in &report.version_mismatches {
-        output.push_str(&format!(
-            "[error] {} ({}) has multiple resolutions:\n",
-            mismatch.dependency, mismatch.source
-        ));
-        for version in &mismatch.versions {
-            let projects = version
-                .occurrences
-                .iter()
-                .map(|occurrence| occurrence.project.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            output.push_str(&format!(
-                "  {}: {}\n",
-                resolution_display(version),
-                projects
-            ));
-        }
-    }
-
-    if !report.local_version_mismatches.is_empty() {
-        output.push_str("[error] local package lock entries are stale or invalid:\n");
-        for mismatch in &report.local_version_mismatches {
-            output.push_str(&format!(
-                "  - {} in {} locks {} from {}: {}\n",
-                mismatch.dependency,
-                mismatch.manifest,
-                mismatch.locked_version,
-                mismatch.local_path,
-                mismatch.message
-            ));
-            if let Some(declared_manifest) = &mismatch.declared_manifest {
-                output.push_str(&format!("    declared manifest: {declared_manifest}\n"));
+    } else {
+        if !report.missing_manifests.is_empty() {
+            output.push_str("[error] missing manifest.toml files:\n");
+            for missing in &report.missing_manifests {
+                output.push_str(&format!("  - {}: {}\n", missing.project, missing.manifest));
             }
         }
+
+        if !report.manifest_errors.is_empty() {
+            output.push_str("[error] invalid manifest.toml files:\n");
+            for error in &report.manifest_errors {
+                output.push_str(&format!(
+                    "  - {}: {} ({})\n",
+                    error.project, error.manifest, error.message
+                ));
+            }
+        }
+
+        for mismatch in &report.version_mismatches {
+            output.push_str(&format!(
+                "[error] {} ({}) has multiple resolutions:\n",
+                mismatch.dependency, mismatch.source
+            ));
+            for version in &mismatch.versions {
+                let projects = version
+                    .occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.project.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!(
+                    "  {}: {}\n",
+                    resolution_display(version),
+                    projects
+                ));
+            }
+        }
+
+        if !report.local_version_mismatches.is_empty() {
+            output.push_str("[error] local package lock entries are stale or invalid:\n");
+            for mismatch in &report.local_version_mismatches {
+                output.push_str(&format!(
+                    "  - {} in {} locks {} from {}: {}\n",
+                    mismatch.dependency,
+                    mismatch.manifest,
+                    mismatch.locked_version,
+                    mismatch.local_path,
+                    mismatch.message
+                ));
+                if let Some(declared_manifest) = &mismatch.declared_manifest {
+                    output.push_str(&format!("    declared manifest: {declared_manifest}\n"));
+                }
+            }
+        }
+    }
+
+    if let Some(vendor_report) = vendor_report {
+        output.push('\n');
+        output.push_str(&render_vendor_plain(vendor_report));
     }
 
     output
 }
 
-fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) -> String {
+fn render_rich(
+    report: &DependencyVersionReport,
+    vendor_report: Option<&VendorCheckReport>,
+    terminal_width: Option<u16>,
+) -> String {
     let width = terminal_width
         .map(usize::from)
         .unwrap_or(DEFAULT_RICH_WIDTH)
         .max(1);
     let mut output = String::new();
 
+    let status = combined_status(report, vendor_report);
     push_border_line(&mut output, '╭', '─', '╮', width);
     push_bordered_line(&mut output, "Dependency Versions", width, Some(BOLD_CYAN));
     push_separator_line(&mut output, width);
     push_bordered_line(
         &mut output,
-        &format!("Status: {}", report.status),
+        &format!("Status: {status}"),
         width,
-        Some(if report.is_success() {
-            BOLD_GREEN
-        } else {
-            BOLD_RED
-        }),
+        Some(if status == "ok" { BOLD_GREEN } else { BOLD_RED }),
     );
     push_bordered_line(
         &mut output,
@@ -153,6 +208,10 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
             Some(BOLD_GREEN),
         );
         push_border_line(&mut output, '╰', '─', '╯', width);
+        if let Some(vendor_report) = vendor_report {
+            output.push('\n');
+            output.push_str(&render_vendor_plain(vendor_report));
+        }
         return output;
     }
 
@@ -252,6 +311,37 @@ fn render_rich(report: &DependencyVersionReport, terminal_width: Option<u16>) ->
     }
 
     push_border_line(&mut output, '╰', '─', '╯', width);
+    if let Some(vendor_report) = vendor_report {
+        output.push('\n');
+        output.push_str(&render_vendor_plain(vendor_report));
+    }
+    output
+}
+
+fn render_vendor_plain(report: &VendorCheckReport) -> String {
+    let mut output = format!(
+        "Dependency Vendor\nStatus: {}\nDirectory: {}\nPackages: {}/{} checked\n",
+        report.status,
+        report.directory,
+        report.checked_package_count,
+        report.expected_package_count
+    );
+    if report.is_success() {
+        output.push_str("[ok] all locked external dependencies are vendored\n");
+        return output;
+    }
+    for error in &report.inventory_errors {
+        output.push_str(&format!("[error] {error}\n"));
+    }
+    for project in &report.stale_projects {
+        output.push_str(&format!("[error] stale vendor snapshot for {project}\n"));
+    }
+    for artifact in &report.missing_artifacts {
+        output.push_str(&format!("[error] missing {artifact}\n"));
+    }
+    for artifact in &report.invalid_artifacts {
+        output.push_str(&format!("[error] {artifact}\n"));
+    }
     output
 }
 
@@ -496,6 +586,59 @@ packages = [
         assert_eq!(output.exit_code, 0);
         assert_eq!(value["status"], "ok");
         assert_eq!(value["checked_manifest_count"], 1);
+    }
+
+    #[test]
+    fn deps_check_reports_missing_vendor_inventory() {
+        let test_workspace = TestWorkspace::new("gomo-deps-command-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            "[workspace]\nproject_roots = [\"apps/*\"]\n\n[vendoring]\n",
+        );
+        test_workspace.write_manifest("apps/demo", "name = \"demo\"\nversion = \"0.1.0\"\n");
+        test_workspace.write_file("apps/demo/manifest.toml", "packages = []\n");
+
+        let output = run(
+            test_workspace.path(),
+            OutputOptions {
+                ci: true,
+                ..OutputOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.contains("Status: error"));
+        assert!(output.stdout.contains("Dependency Vendor"));
+        assert!(output.stdout.contains("failed to read vendor inventory"));
+    }
+
+    #[test]
+    fn deps_check_json_reports_combined_vendor_error_status() {
+        let test_workspace = TestWorkspace::new("gomo-deps-command-test");
+        test_workspace.write_file(
+            "gomo.toml",
+            "[workspace]\nproject_roots = [\"apps/*\"]\n\n[vendoring]\n",
+        );
+        test_workspace.write_manifest("apps/demo", "name = \"demo\"\nversion = \"0.1.0\"\n");
+        test_workspace.write_file("apps/demo/manifest.toml", "packages = []\n");
+
+        let output = run(
+            test_workspace.path(),
+            OutputOptions {
+                json: true,
+                ci: true,
+                tui: false,
+                terminal_width: None,
+            },
+        )
+        .expect("deps check JSON should render");
+        let value: serde_json::Value =
+            serde_json::from_str(&output.stdout).expect("JSON should parse");
+
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["vendoring"]["status"], "error");
     }
 
     fn assert_lines_fit(output: &str, width: usize) {

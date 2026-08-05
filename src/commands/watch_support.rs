@@ -22,7 +22,12 @@ pub(crate) fn normalize_paths(workspace: &Workspace, events: &[Event]) -> (Vec<P
             } else {
                 path
             };
-            if relative.as_os_str().is_empty() || is_generated_path(relative) {
+            let is_vendor_path = workspace
+                .vendoring
+                .as_ref()
+                .and_then(|config| config.dir.strip_prefix(&workspace.root).ok())
+                .is_some_and(|vendor| relative.starts_with(vendor));
+            if relative.as_os_str().is_empty() || is_generated_path(relative) || is_vendor_path {
                 continue;
             }
             let path_is_structural = is_structural_path(workspace, relative);
@@ -159,5 +164,28 @@ version = "0.1.0"
 
         assert_eq!(paths, [PathBuf::from("apps/demo/gleam.toml")]);
         assert!(structural);
+    }
+
+    #[test]
+    fn ignores_the_configured_vendor_directory() {
+        let test_workspace = TestWorkspace::new("gomo-watch-paths");
+        test_workspace.write_file(
+            "gomo.toml",
+            "[workspace]\nproject_roots = [\"apps/*\"]\n\n[vendoring]\ndir = \"./third_party\"\n",
+        );
+        test_workspace.write_manifest("apps/demo", "name = \"demo\"\nversion = \"0.1.0\"\n");
+        let workspace = workspace::discover(test_workspace.path()).expect("workspace should load");
+        let event = Event {
+            tags: vec![Tag::Path {
+                path: workspace.root.join("third_party/gomo-vendor.toml"),
+                file_type: Some(FileType::File),
+            }],
+            ..Event::default()
+        };
+
+        let (paths, structural) = normalize_paths(&workspace, &[event]);
+
+        assert!(paths.is_empty());
+        assert!(!structural);
     }
 }

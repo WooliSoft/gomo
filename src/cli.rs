@@ -105,7 +105,7 @@ enum Commands {
     },
     /// Validate the current workspace and dependency graph.
     Doctor,
-    /// Inspect resolved dependency versions from Gleam manifest.toml files.
+    /// Check and vendor dependencies from Gleam manifest.toml files.
     Deps {
         #[command(subcommand)]
         command: DepsCommands,
@@ -240,6 +240,8 @@ enum Commands {
 enum DepsCommands {
     /// Check resolved dependency versions across project manifest.toml files.
     Check,
+    /// Synchronize locked Hex and Git packages into the configured vendor directory.
+    Vendor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -426,6 +428,9 @@ fn execute_from_with_terminal(
         Some(Commands::Deps {
             command: DepsCommands::Check,
         }) => commands::deps::run(cwd, output_options),
+        Some(Commands::Deps {
+            command: DepsCommands::Vendor,
+        }) => commands::vendor::run(cwd, output_options),
         Some(Commands::Explain {
             target,
             task,
@@ -1236,6 +1241,19 @@ version = "0.1.0"
                 command: DepsCommands::Check,
             }) => {}
             other => panic!("expected deps check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_deps_vendor_command() {
+        let cli =
+            Cli::try_parse_from(["gomo", "deps", "vendor"]).expect("deps vendor args should parse");
+
+        match cli.command {
+            Some(Commands::Deps {
+                command: DepsCommands::Vendor,
+            }) => {}
+            other => panic!("expected deps vendor command, got {other:?}"),
         }
     }
 

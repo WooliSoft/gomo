@@ -417,6 +417,7 @@ mod tests {
             cache_max_age_seconds: None,
             cache_max_size_bytes: None,
             remote_cache: None,
+            vendoring: None,
             project_globs: vec!["apps/*".to_string(), "libs/*".to_string()],
             default_parallelism: DefaultParallelism::Auto,
             global_target_inputs: BTreeMap::new(),

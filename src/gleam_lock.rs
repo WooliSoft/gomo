@@ -20,6 +20,7 @@ pub(crate) struct LockedPackage {
     pub(crate) path: Option<PathBuf>,
     pub(crate) repo: Option<String>,
     pub(crate) commit: Option<String>,
+    pub(crate) outer_checksum: Option<String>,
 }
 
 /// Resolved package source from a Gleam `manifest.toml` package entry.
@@ -27,6 +28,7 @@ pub(crate) struct LockedPackage {
 pub(crate) enum LockedPackageSource {
     Hex,
     Local,
+    Git,
     Other(String),
 }
 
@@ -44,12 +46,14 @@ struct RawLockedPackage {
     path: Option<PathBuf>,
     repo: Option<String>,
     commit: Option<String>,
+    outer_checksum: Option<String>,
 }
 
 impl LockedPackageSource {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Hex => "hex",
+            Self::Git => "git",
             Self::Local => "local",
             Self::Other(source) => source.as_str(),
         }
@@ -58,6 +62,7 @@ impl LockedPackageSource {
     fn parse(source: String) -> Self {
         match source.as_str() {
             "hex" => Self::Hex,
+            "git" => Self::Git,
             "local" => Self::Local,
             _ => Self::Other(source),
         }
@@ -107,6 +112,7 @@ pub(crate) fn parse_lock_manifest(path: &Path) -> Result<GleamLockManifest> {
             path: package.path,
             repo: normalize_optional(package.repo),
             commit: normalize_optional(package.commit),
+            outer_checksum: normalize_checksum(package.outer_checksum),
         });
     }
 
@@ -118,6 +124,7 @@ pub(crate) fn parse_lock_manifest(path: &Path) -> Result<GleamLockManifest> {
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.repo.cmp(&right.repo))
             .then_with(|| left.commit.cmp(&right.commit))
+            .then_with(|| left.outer_checksum.cmp(&right.outer_checksum))
     });
 
     Ok(GleamLockManifest { packages })
@@ -126,6 +133,12 @@ pub(crate) fn parse_lock_manifest(path: &Path) -> Result<GleamLockManifest> {
 fn normalize_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_checksum(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_ascii_uppercase())
         .filter(|value| !value.is_empty())
 }
 
@@ -142,9 +155,9 @@ mod tests {
             "manifest.toml",
             r#"
 packages = [
-  { name = "gleam_stdlib", version = "1.0.2", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "abc" },
+  { name = "gleam_stdlib", version = "1.0.2", build_tools = ["gleam"], requirements = ["z_dep", "a_dep", "a_dep", " "], otp_app = "gleam_stdlib", source = "hex", outer_checksum = " abC " },
   { name = "shared", version = "0.1.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], source = "local", path = "../shared" },
-  { name = "lustre", version = "5.7.0", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/lustre-labs/lustre", commit = "abc123" },
+  { name = "lustre", version = "5.7.0", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/lustre-labs/lustre", commit = "abc123", path = "../git-deps/lustre" },
 ]
 
 [requirements]
@@ -158,16 +171,23 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
         assert_eq!(manifest.packages[0].name, "gleam_stdlib");
         assert_eq!(manifest.packages[0].version, "1.0.2");
         assert_eq!(manifest.packages[0].source, LockedPackageSource::Hex);
+        assert_eq!(manifest.packages[0].outer_checksum.as_deref(), Some("ABC"));
         assert_eq!(manifest.packages[1].name, "shared");
         assert_eq!(manifest.packages[1].version, "0.1.0");
         assert_eq!(manifest.packages[1].source, LockedPackageSource::Local);
         assert_eq!(manifest.packages[1].path, Some(PathBuf::from("../shared")));
+        assert_eq!(manifest.packages[1].outer_checksum, None);
         assert_eq!(manifest.packages[2].name, "lustre");
-        assert_eq!(manifest.packages[2].source.as_str(), "git");
+        assert_eq!(manifest.packages[2].source, LockedPackageSource::Git);
         assert_eq!(
             manifest.packages[2].repo.as_deref(),
             Some("https://github.com/lustre-labs/lustre")
         );
         assert_eq!(manifest.packages[2].commit.as_deref(), Some("abc123"));
+        assert_eq!(
+            manifest.packages[2].path,
+            Some(PathBuf::from("../git-deps/lustre"))
+        );
+        assert_eq!(manifest.packages[2].outer_checksum, None);
     }
 }
