@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::Read;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,8 +31,8 @@ use gomo_cache_protocol::{
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePoolOptions};
+use sqlx::{Row, Sqlite, SqlitePool};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -39,6 +40,8 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
+
+const DEFAULT_DATABASE_URL: &str = "sqlite://gomo-cache.db";
 
 #[derive(Parser)]
 #[command(name = "gomo-cache-server", version)]
@@ -105,7 +108,8 @@ impl Config {
             .map(str::to_string)
             .collect();
         Ok(Self {
-            database_url: required("GOMO_CACHE_DATABASE_URL")?,
+            database_url: env::var("GOMO_CACHE_DATABASE_URL")
+                .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string()),
             listen,
             workspace: required("GOMO_CACHE_WORKSPACE")?,
             bucket: required("GOMO_CACHE_S3_BUCKET")?,
@@ -142,13 +146,72 @@ fn required(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} is required"))
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn format_unix_timestamp(seconds: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .map(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| seconds.to_string())
+        })
+        .unwrap_or_else(|_| seconds.to_string())
+}
+
+fn encode_string_list(values: &[String]) -> Result<String> {
+    serde_json::to_string(values).context("failed to encode string list as JSON")
+}
+
+fn decode_string_list(value: &str) -> Result<Vec<String>> {
+    serde_json::from_str(value).context("failed to decode string list JSON")
+}
+
+fn uuid_text(id: Uuid) -> String {
+    id.to_string()
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid> {
+    Uuid::parse_str(value).with_context(|| format!("invalid UUID text: {value}"))
+}
+
+async fn connect_pool(database_url: &str) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::from_str(database_url)
+        .with_context(|| format!("invalid GOMO_CACHE_DATABASE_URL: {database_url}"))?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5))
+        .locking_mode(SqliteLockingMode::Exclusive)
+        .journal_mode(SqliteJournalMode::Wal);
+    SqlitePoolOptions::new()
+        .min_connections(1)
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(options)
+        .await
+        .context("failed to connect to SQLite")
+}
+
+async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    sqlx::migrate::Migrator::new(path.as_path())
+        .await?
+        .run(pool)
+        .await?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AppState {
-    pool: PgPool,
+    pool: SqlitePool,
     s3: S3Client,
     config: Config,
     workspace_id: Uuid,
-    instance_id: String,
     metrics: Arc<Metrics>,
     oidc: Arc<OidcState>,
 }
@@ -199,14 +262,10 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let config = Config::load()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await
-        .context("failed to connect to PostgreSQL")?;
+    let pool = connect_pool(&config.database_url).await?;
     match cli.command {
         Command::Migrate => {
-            sqlx::migrate!("./migrations").run(&pool).await?;
+            run_migrations(&pool).await?;
             info!("database migrations complete");
         }
         Command::Doctor => {
@@ -217,7 +276,7 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .context("failed to access cache bucket")?;
-            info!("PostgreSQL and object storage are ready");
+            info!("SQLite and object storage are ready");
         }
         Command::Serve => serve(config, pool).await?,
         Command::Gc { batch_size } => {
@@ -229,8 +288,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn administration_state(config: Config, pool: PgPool) -> Result<AppState> {
-    let workspace_id = sqlx::query_scalar("SELECT id FROM workspaces WHERE slug = $1")
+async fn administration_state(config: Config, pool: SqlitePool) -> Result<AppState> {
+    let workspace_id = sqlx::query_scalar::<_, String>("SELECT id FROM workspaces WHERE slug = $1")
         .bind(&config.workspace)
         .fetch_one(&pool)
         .await?;
@@ -238,8 +297,7 @@ async fn administration_state(config: Config, pool: PgPool) -> Result<AppState> 
         s3: s3_client(&config).await,
         config,
         pool,
-        workspace_id,
-        instance_id: Uuid::new_v4().to_string(),
+        workspace_id: parse_uuid(&workspace_id)?,
         metrics: Arc::new(Metrics::default()),
         oidc: Arc::new(OidcState::default()),
     })
@@ -247,14 +305,14 @@ async fn administration_state(config: Config, pool: PgPool) -> Result<AppState> 
 
 async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
     let batch_size = batch_size.max(1);
-    sqlx::query("DELETE FROM blob_leases WHERE expires_at <= now()")
-        .execute(&state.pool)
-        .await?;
+    let now = unix_now();
     sqlx::query(
         "DELETE FROM access_tokens
-         WHERE (expires_at IS NOT NULL AND expires_at <= now())
-            OR (revoked_at IS NOT NULL AND revoked_at < now() - interval '7 days')",
+         WHERE (expires_at IS NOT NULL AND expires_at <= $1)
+            OR (revoked_at IS NOT NULL AND revoked_at < $2)",
     )
+    .bind(now)
+    .bind(now - 7 * 24 * 3600)
     .execute(&state.pool)
     .await?;
     let expired_objects = expire_upload_sessions(state, batch_size).await?;
@@ -271,43 +329,38 @@ async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
         }
     }
 
-    let mut blob_ids = sqlx::query_scalar::<_, Uuid>(
-        "WITH victims AS (
+    let mut blob_ids = sqlx::query_scalar::<_, String>(
+        "DELETE FROM cache_entries
+         WHERE id IN (
            SELECT e.id
            FROM cache_entries e
            JOIN cache_scopes s ON s.id = e.scope_id
            JOIN workspaces w ON w.id = e.workspace_id
            WHERE e.workspace_id = $1
-             AND e.last_access_at < now() -
-               make_interval(secs => CASE WHEN s.kind = 'shared'
-                 THEN w.shared_retention_seconds ELSE w.isolated_retention_seconds END)
+             AND e.last_access_at < $2 -
+               CASE WHEN s.kind = 'shared'
+                 THEN w.shared_retention_seconds ELSE w.isolated_retention_seconds END
            ORDER BY e.last_access_at
-           FOR UPDATE OF e SKIP LOCKED
-           LIMIT $2
+           LIMIT $3
          )
-         DELETE FROM cache_entries e USING victims
-         WHERE e.id = victims.id
-         RETURNING e.blob_id",
+         RETURNING blob_id",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
+    .bind(now)
     .bind(batch_size)
     .fetch_all(&state.pool)
     .await?;
-    let orphan_ids = sqlx::query_scalar::<_, Uuid>(
+    let orphan_ids = sqlx::query_scalar::<_, String>(
         "SELECT b.id
          FROM blobs b
          WHERE b.workspace_id = $1
-           AND b.created_at < now() - interval '1 hour'
+           AND b.created_at < $2
            AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.blob_id = b.id)
-           AND NOT EXISTS (
-             SELECT 1 FROM blob_leases l
-             WHERE l.blob_id = b.id AND l.expires_at > now()
-           )
          ORDER BY b.created_at
-         FOR UPDATE SKIP LOCKED
-         LIMIT $2",
+         LIMIT $3",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
+    .bind(now - 3600)
     .bind(batch_size)
     .fetch_all(&state.pool)
     .await?;
@@ -319,14 +372,9 @@ async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
         let row = sqlx::query(
             "SELECT object_key FROM blobs b
              WHERE b.id = $1
-               AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.blob_id = b.id)
-               AND NOT EXISTS (
-                 SELECT 1 FROM blob_leases l
-                 WHERE l.blob_id = b.id AND l.expires_at > now()
-               )
-             FOR UPDATE SKIP LOCKED",
+               AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.blob_id = b.id)",
         )
-        .bind(blob_id)
+        .bind(&blob_id)
         .fetch_optional(&state.pool)
         .await?;
         let Some(row) = row else {
@@ -334,28 +382,35 @@ async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
         };
         let object_key: String = row.get("object_key");
         sqlx::query("UPDATE blobs SET state = 'deleting' WHERE id = $1")
-            .bind(blob_id)
+            .bind(&blob_id)
             .execute(&state.pool)
             .await?;
-        state
+        // S3 I/O is outside any DB transaction so the single SQLite connection
+        // stays available to other requests.
+        if let Err(error) = state
             .s3
             .delete_object()
             .bucket(&state.config.bucket)
-            .key(object_key)
+            .key(&object_key)
             .send()
-            .await?;
+            .await
+        {
+            error!(%error, %blob_id, %object_key, "failed to remove unreferenced object");
+            continue;
+        }
         sqlx::query("DELETE FROM blobs WHERE id = $1")
-            .bind(blob_id)
+            .bind(&blob_id)
             .execute(&state.pool)
             .await?;
         removed += 1;
     }
     sqlx::query(
-        "DELETE FROM cache_scopes s
-         WHERE s.workspace_id = $1 AND s.expires_at <= now()
-           AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.scope_id = s.id)",
+        "DELETE FROM cache_scopes
+         WHERE workspace_id = $1 AND expires_at IS NOT NULL AND expires_at <= $2
+           AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.scope_id = cache_scopes.id)",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
+    .bind(now)
     .execute(&state.pool)
     .await?;
     Ok(removed)
@@ -363,15 +418,16 @@ async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
 
 async fn expire_upload_sessions(state: &AppState, batch_size: i64) -> Result<Vec<String>> {
     let mut tx = state.pool.begin().await?;
+    let now = unix_now();
     let rows = sqlx::query(
         "SELECT id, object_key, reserved_quota_bytes
          FROM upload_sessions
-         WHERE workspace_id = $1 AND state = 'uploading' AND expires_at <= now()
+         WHERE workspace_id = $1 AND state = 'uploading' AND expires_at <= $2
          ORDER BY expires_at
-         FOR UPDATE SKIP LOCKED
-         LIMIT $2",
+         LIMIT $3",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
+    .bind(now)
     .bind(batch_size)
     .fetch_all(&mut *tx)
     .await?;
@@ -381,7 +437,7 @@ async fn expire_upload_sessions(state: &AppState, batch_size: i64) -> Result<Vec
     }
     let ids = rows
         .iter()
-        .map(|row| row.get::<Uuid, _>("id"))
+        .map(|row| row.get::<String, _>("id"))
         .collect::<Vec<_>>();
     let reserved = rows
         .iter()
@@ -391,20 +447,27 @@ async fn expire_upload_sessions(state: &AppState, batch_size: i64) -> Result<Vec
         .iter()
         .map(|row| row.get::<String, _>("object_key"))
         .collect::<Vec<_>>();
-    sqlx::query(
+    let ids_json = serde_json::to_string(&ids).context("failed to encode upload session ids")?;
+    let updated = sqlx::query(
         "UPDATE upload_sessions
-         SET state = 'expired', completed_at = now(), reserved_quota_bytes = 0
-         WHERE id = ANY($1)",
+         SET state = 'expired', completed_at = $1, reserved_quota_bytes = 0
+         WHERE id IN (SELECT value FROM json_each($2))
+           AND state = 'uploading' AND expires_at <= $3",
     )
-    .bind(&ids)
+    .bind(now)
+    .bind(ids_json)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
+    if updated.rows_affected() != ids.len() as u64 {
+        bail!("upload sessions changed while expiring them");
+    }
     sqlx::query(
         "UPDATE workspaces
-         SET reserved_bytes = GREATEST(0, reserved_bytes - $2)
+         SET reserved_bytes = max(0, reserved_bytes - $2)
          WHERE id = $1",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
     .bind(reserved)
     .execute(&mut *tx)
     .await?;
@@ -535,42 +598,53 @@ async fn upload_object(
     upload_result
 }
 
-async fn serve(config: Config, pool: PgPool) -> Result<()> {
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    let workspace_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO workspaces (slug, maximum_entry_size) VALUES ($1, $2)
-         ON CONFLICT (slug) DO UPDATE SET enabled = true
+async fn serve(config: Config, pool: SqlitePool) -> Result<()> {
+    run_migrations(&pool).await?;
+    let workspace_id = Uuid::new_v4();
+    let workspace_id_text: String = sqlx::query_scalar(
+        "INSERT INTO workspaces (id, slug, maximum_entry_size) VALUES ($1, $2, $3)
+         ON CONFLICT (slug) DO UPDATE
+         SET enabled = 1, maximum_entry_size = excluded.maximum_entry_size
          RETURNING id",
     )
+    .bind(uuid_text(workspace_id))
     .bind(&config.workspace)
     .bind(config.max_entry_size_bytes as i64)
     .fetch_one(&pool)
     .await?;
-    let principal_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO principals (workspace_id, kind, external_subject, display_name)
-         VALUES ($1, 'service', 'bootstrap-static-token', 'static cache token')
+    let workspace_id = parse_uuid(&workspace_id_text)?;
+    let principal_id = Uuid::new_v4();
+    let principal_id_text: String = sqlx::query_scalar(
+        "INSERT INTO principals (id, workspace_id, kind, external_subject, display_name)
+         VALUES ($1, $2, 'service', 'bootstrap-static-token', 'static cache token')
          ON CONFLICT (workspace_id, kind, external_subject)
-         DO UPDATE SET enabled = true, last_seen_at = now()
+         DO UPDATE SET enabled = 1, last_seen_at = $3
          RETURNING id",
     )
-    .bind(workspace_id)
+    .bind(uuid_text(principal_id))
+    .bind(uuid_text(workspace_id))
+    .bind(unix_now())
     .fetch_one(&pool)
     .await?;
+    let principal_id = parse_uuid(&principal_id_text)?;
     let token_hash = *blake3::hash(config.token.as_bytes()).as_bytes();
     let public_prefix = config.token.chars().take(8).collect::<String>();
     let capability_values = config.capabilities.iter().cloned().collect::<Vec<_>>();
+    let capabilities_json = encode_string_list(&capability_values)?;
+    let token_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO access_tokens
-           (public_prefix, principal_id, token_hash, capabilities, allowed_run_scope)
-         VALUES ($1, $2, $3, $4, $5)
+           (id, public_prefix, principal_id, token_hash, capabilities, allowed_run_scope)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (token_hash) DO UPDATE
-         SET revoked_at = NULL, capabilities = EXCLUDED.capabilities,
-             allowed_run_scope = EXCLUDED.allowed_run_scope",
+         SET revoked_at = NULL, capabilities = excluded.capabilities,
+             allowed_run_scope = excluded.allowed_run_scope",
     )
+    .bind(uuid_text(token_id))
     .bind(public_prefix)
-    .bind(principal_id)
+    .bind(uuid_text(principal_id))
     .bind(token_hash.as_slice())
-    .bind(capability_values)
+    .bind(capabilities_json)
     .bind(config.allowed_run_id.as_deref())
     .execute(&pool)
     .await?;
@@ -579,7 +653,6 @@ async fn serve(config: Config, pool: PgPool) -> Result<()> {
         pool,
         config: config.clone(),
         workspace_id,
-        instance_id: Uuid::new_v4().to_string(),
         metrics: Arc::new(Metrics::default()),
         oidc: Arc::new(OidcState::default()),
     });
@@ -744,7 +817,7 @@ async fn exchange_github_oidc(
          WHERE workspace_id = $1 AND issuer = $2
            AND repository_owner_id = $3 AND repository_id = $4",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
     .bind(&claims.iss)
     .bind(&claims.repository_owner_id)
     .bind(&claims.repository_id)
@@ -769,8 +842,15 @@ async fn exchange_github_oidc(
             "no OIDC trust rule matches this repository and workflow",
         );
     };
-    let trusted_refs: Vec<String> = rule.get("trusted_refs");
-    let trusted_environments: Vec<String> = rule.get("trusted_environments");
+    let trusted_refs = match decode_string_list(&rule.get::<String, _>("trusted_refs")) {
+        Ok(values) => values,
+        Err(error) => return internal_error(error),
+    };
+    let trusted_environments =
+        match decode_string_list(&rule.get::<String, _>("trusted_environments")) {
+            Ok(values) => values,
+            Err(error) => return internal_error(error),
+        };
     let trusted = claims
         .r#ref
         .as_ref()
@@ -779,28 +859,38 @@ async fn exchange_github_oidc(
             .environment
             .as_ref()
             .is_some_and(|value| trusted_environments.contains(value));
-    let rule_capabilities = rule.get::<Vec<String>, _>("capabilities");
+    let rule_capabilities = match decode_string_list(&rule.get::<String, _>("capabilities")) {
+        Ok(values) => values,
+        Err(error) => return internal_error(error),
+    };
     let capabilities = oidc_capabilities(&rule_capabilities, trusted);
     let run_scope = format!(
         "{}:{}:{}",
         claims.repository_id, claims.run_id, claims.run_attempt
     );
-    let principal_id: Uuid = match sqlx::query_scalar(
+    let principal_id = Uuid::new_v4();
+    let principal_id_text: String = match sqlx::query_scalar(
         "INSERT INTO principals
-           (workspace_id, kind, external_subject, display_name, last_seen_at)
-         VALUES ($1, 'ci', $2, $3, now())
+           (id, workspace_id, kind, external_subject, display_name, last_seen_at)
+         VALUES ($1, $2, 'ci', $3, $4, $5)
          ON CONFLICT (workspace_id, kind, external_subject)
-         DO UPDATE SET enabled = true, last_seen_at = now()
+         DO UPDATE SET enabled = 1, last_seen_at = excluded.last_seen_at
          RETURNING id",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(principal_id))
+    .bind(uuid_text(state.workspace_id))
     .bind(&claims.sub)
     .bind(&claims.repository)
+    .bind(unix_now())
     .fetch_one(&state.pool)
     .await
     {
         Ok(id) => id,
         Err(error) => return internal_error(error.into()),
+    };
+    let principal_id = match parse_uuid(&principal_id_text) {
+        Ok(id) => id,
+        Err(error) => return internal_error(error),
     };
     let raw_token = format!(
         "gomo_oidc_{}{}",
@@ -810,19 +900,24 @@ async fn exchange_github_oidc(
     let token_hash = blake3::hash(raw_token.as_bytes());
     let public_prefix = raw_token.chars().take(12).collect::<String>();
     let ttl = state.config.oidc_token_ttl_seconds.clamp(60, 3600);
+    let capabilities_json = match encode_string_list(&capabilities) {
+        Ok(value) => value,
+        Err(error) => return internal_error(error),
+    };
+    let expires_at = unix_now() + ttl;
     if let Err(error) = sqlx::query(
         "INSERT INTO access_tokens
-           (public_prefix, principal_id, token_hash, capabilities, expires_at,
+           (id, public_prefix, principal_id, token_hash, capabilities, expires_at,
             allowed_run_scope, source_repository, source_ref, source_commit,
             source_run)
-         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6,
-                 $7, $8, $9, $10)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
+    .bind(uuid_text(Uuid::new_v4()))
     .bind(public_prefix)
-    .bind(principal_id)
+    .bind(uuid_text(principal_id))
     .bind(token_hash.as_bytes().as_slice())
-    .bind(&capabilities)
-    .bind(ttl)
+    .bind(capabilities_json)
+    .bind(expires_at)
     .bind(&run_scope)
     .bind(&claims.repository)
     .bind(claims.r#ref.as_deref())
@@ -833,14 +928,9 @@ async fn exchange_github_oidc(
     {
         return internal_error(error.into());
     }
-    let expires_at_unix_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-        + ttl;
     Json(GithubOidcExchangeResponse {
         token: raw_token,
-        expires_at_unix_seconds,
+        expires_at_unix_seconds: expires_at,
         capabilities,
         run_scope,
     })
@@ -920,29 +1010,32 @@ async fn lookup_entry(state: &AppState, task_hash: &str, scope: &str) -> Result<
     let row = sqlx::query(
         "SELECT e.id AS entry_id, b.id AS blob_id, b.bundle_digest, e.result_digest,
                 b.compressed_byte_length, b.object_key, s.external_scope_key,
-                e.created_at::text AS created_at
+                e.created_at
          FROM cache_entries e
          JOIN blobs b ON b.id = e.blob_id AND b.state = 'available'
          JOIN cache_scopes s ON s.id = e.scope_id
          WHERE e.workspace_id = $1 AND s.external_scope_key = $2
            AND e.protocol_version = $3 AND e.task_hash = $4",
     )
-    .bind(state.workspace_id)
+    .bind(uuid_text(state.workspace_id))
     .bind(scope_key(scope))
     .bind(PROTOCOL_VERSION)
     .bind(task_hash)
     .fetch_optional(&state.pool)
     .await?;
-    Ok(row.map(|row| EntryRow {
-        entry_id: row.get("entry_id"),
-        blob_id: row.get("blob_id"),
-        bundle_digest: row.get("bundle_digest"),
-        result_digest: row.get("result_digest"),
-        byte_len: row.get("compressed_byte_length"),
-        object_key: row.get("object_key"),
-        scope: row.get("external_scope_key"),
-        created_at: row.get("created_at"),
-    }))
+    row.map(|row| -> Result<EntryRow> {
+        Ok(EntryRow {
+            entry_id: parse_uuid(&row.get::<String, _>("entry_id"))?,
+            blob_id: parse_uuid(&row.get::<String, _>("blob_id"))?,
+            bundle_digest: row.get("bundle_digest"),
+            result_digest: row.get("result_digest"),
+            byte_len: row.get("compressed_byte_length"),
+            object_key: row.get("object_key"),
+            scope: row.get("external_scope_key"),
+            created_at: format_unix_timestamp(row.get("created_at")),
+        })
+    })
+    .transpose()
 }
 
 async fn head_cache(
@@ -989,19 +1082,6 @@ async fn get_cache(
         .metrics
         .download_bytes
         .fetch_add(entry.byte_len as u64, Ordering::Relaxed);
-    let request_id = Uuid::new_v4();
-    if let Err(error) = sqlx::query(
-        "INSERT INTO blob_leases (blob_id, request_id, service_instance_id, expires_at)
-         VALUES ($1, $2, $3, now() + interval '10 minutes')",
-    )
-    .bind(entry.blob_id)
-    .bind(request_id)
-    .bind(&state.instance_id)
-    .execute(&state.pool)
-    .await
-    {
-        return internal_error(error.into());
-    }
     let object = state
         .s3
         .get_object()
@@ -1015,15 +1095,16 @@ async fn get_cache(
         )),
         Err(error) => {
             let _ = sqlx::query("UPDATE blobs SET state = 'failed' WHERE id = $1")
-                .bind(entry.blob_id)
+                .bind(uuid_text(entry.blob_id))
                 .execute(&state.pool)
                 .await;
             error!(%error, blob_id = %entry.blob_id, "published object is missing");
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let _ = sqlx::query("UPDATE cache_entries SET last_access_at = now() WHERE id = $1")
-        .bind(entry.entry_id)
+    let _ = sqlx::query("UPDATE cache_entries SET last_access_at = $2 WHERE id = $1")
+        .bind(uuid_text(entry.entry_id))
+        .bind(unix_now())
         .execute(&state.pool)
         .await;
     entry_headers(StatusCode::OK, &entry, body)
@@ -1227,16 +1308,18 @@ async fn put_cache(
         }
     };
     let blob_id = Uuid::new_v4();
+    let now = unix_now();
     if let Err(error) = sqlx::query(
         "INSERT INTO blobs
           (id, workspace_id, bundle_digest, object_key, compressed_byte_length, state, last_verified_at)
-         VALUES ($1, $2, $3, $4, $5, 'available', now())",
+         VALUES ($1, $2, $3, $4, $5, 'available', $6)",
     )
-    .bind(blob_id)
-    .bind(state.workspace_id)
+    .bind(uuid_text(blob_id))
+    .bind(uuid_text(state.workspace_id))
     .bind(&bundle_digest)
     .bind(&object_key)
     .bind(expected_length as i64)
+    .bind(now)
     .execute(&mut *tx)
     .await
     {
@@ -1244,22 +1327,24 @@ async fn put_cache(
         abandon_upload(&state, upload_session, &object_key).await;
         return internal_error(error.into());
     }
+    let entry_id = Uuid::new_v4();
     let inserted = match sqlx::query(
         "INSERT INTO cache_entries
-          (workspace_id, scope_id, protocol_version, cache_schema_version, task_hash,
+          (id, workspace_id, scope_id, protocol_version, cache_schema_version, task_hash,
            result_digest, blob_id, producer_principal_id, source_repository,
            source_ref, source_commit, source_run)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (workspace_id, scope_id, protocol_version, task_hash) DO NOTHING",
     )
-    .bind(state.workspace_id)
-    .bind(scope_id)
+    .bind(uuid_text(entry_id))
+    .bind(uuid_text(state.workspace_id))
+    .bind(uuid_text(scope_id))
     .bind(PROTOCOL_VERSION)
     .bind(CACHE_SCHEMA_VERSION)
     .bind(&task_hash)
     .bind(&result_digest)
-    .bind(blob_id)
-    .bind(auth.principal_id)
+    .bind(uuid_text(blob_id))
+    .bind(uuid_text(auth.principal_id))
     .bind(auth.source_repository.as_deref())
     .bind(auth.source_ref.as_deref())
     .bind(auth.source_commit.as_deref())
@@ -1288,20 +1373,30 @@ async fn put_cache(
             return internal_error(error);
         }
         if let Err(error) = tx.commit().await {
+            abandon_upload(&state, upload_session, &object_key).await;
             return internal_error(error.into());
         }
         let entry = EntryRow {
-            entry_id: Uuid::nil(),
+            entry_id,
             blob_id,
             bundle_digest,
             result_digest,
             byte_len: expected_length as i64,
             object_key,
             scope: scope_key(&scope).to_string(),
-            created_at: "now".to_string(),
+            created_at: format_unix_timestamp(now),
         };
         entry_headers(StatusCode::CREATED, &entry, Body::empty())
     } else {
+        if let Err(error) = sqlx::query("UPDATE blobs SET state = 'deleting' WHERE id = $1")
+            .bind(uuid_text(blob_id))
+            .execute(&mut *tx)
+            .await
+        {
+            drop(tx);
+            abandon_upload(&state, upload_session, &object_key).await;
+            return internal_error(error.into());
+        }
         if let Err(error) =
             finish_upload_in_transaction(&mut tx, state.workspace_id, upload_session, "failed")
                 .await
@@ -1311,6 +1406,7 @@ async fn put_cache(
             return internal_error(error);
         }
         if let Err(error) = tx.commit().await {
+            abandon_upload(&state, upload_session, &object_key).await;
             return internal_error(error.into());
         }
         cleanup_unpublished_blob(&state, blob_id, &object_key).await;
@@ -1363,7 +1459,7 @@ async fn cleanup_unpublished_blob(state: &AppState, blob_id: Uuid, object_key: &
          WHERE id = $1
            AND NOT EXISTS (SELECT 1 FROM cache_entries e WHERE e.blob_id = blobs.id)",
     )
-    .bind(blob_id)
+    .bind(uuid_text(blob_id))
     .execute(&state.pool)
     .await
     {
@@ -1381,40 +1477,38 @@ async fn reserve_upload(
 ) -> Result<Uuid> {
     let requested = i64::try_from(byte_length).context("entry is too large")?;
     let mut tx = state.pool.begin().await?;
-    let row = sqlx::query(
-        "SELECT total_storage_quota, reserved_bytes,
-                COALESCE((SELECT SUM(compressed_byte_length)
-                  FROM blobs WHERE workspace_id = $1 AND state = 'available'), 0)::bigint AS used_bytes
-         FROM workspaces WHERE id = $1 FOR UPDATE",
+    let reserved = sqlx::query(
+        "UPDATE workspaces
+         SET reserved_bytes = reserved_bytes + $2
+         WHERE id = $1
+           AND reserved_bytes + $2 + COALESCE((
+             SELECT SUM(compressed_byte_length)
+             FROM blobs WHERE workspace_id = $1 AND state = 'available'
+           ), 0) <= total_storage_quota",
     )
-    .bind(state.workspace_id)
-    .fetch_one(&mut *tx)
+    .bind(uuid_text(state.workspace_id))
+    .bind(requested)
+    .execute(&mut *tx)
     .await?;
-    let quota: i64 = row.get("total_storage_quota");
-    let reserved: i64 = row.get("reserved_bytes");
-    let used: i64 = row.get("used_bytes");
-    if used.saturating_add(reserved).saturating_add(requested) > quota {
+    if reserved.rows_affected() != 1 {
         bail!("workspace storage quota would be exceeded");
     }
-    sqlx::query("UPDATE workspaces SET reserved_bytes = reserved_bytes + $2 WHERE id = $1")
-        .bind(state.workspace_id)
-        .bind(requested)
-        .execute(&mut *tx)
-        .await?;
     let session = Uuid::new_v4();
+    let expires_at = unix_now() + 3600;
     sqlx::query(
         "INSERT INTO upload_sessions
           (id, workspace_id, scope_id, principal_id, task_hash, object_key,
            expected_byte_length, reserved_quota_bytes, state, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'uploading', now() + interval '1 hour')",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'uploading', $8)",
     )
-    .bind(session)
-    .bind(state.workspace_id)
-    .bind(scope_id)
-    .bind(principal_id)
+    .bind(uuid_text(session))
+    .bind(uuid_text(state.workspace_id))
+    .bind(uuid_text(scope_id))
+    .bind(uuid_text(principal_id))
     .bind(task_hash)
     .bind(object_key)
     .bind(requested)
+    .bind(expires_at)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1422,33 +1516,38 @@ async fn reserve_upload(
 }
 
 async fn finish_upload_in_transaction(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     workspace_id: Uuid,
     session: Uuid,
     upload_state: &str,
 ) -> Result<()> {
-    let reserved: i64 = sqlx::query_scalar(
-        "WITH session AS MATERIALIZED (
-           SELECT id, reserved_quota_bytes
-           FROM upload_sessions WHERE id = $1 FOR UPDATE
-         ), updated AS (
-           UPDATE upload_sessions u
-           SET state = $2::upload_state, completed_at = now(), reserved_quota_bytes = 0
-           FROM session s WHERE u.id = s.id
-           RETURNING u.id
-         )
-         SELECT reserved_quota_bytes FROM session",
+    let reserved: Option<i64> = sqlx::query_scalar(
+        "SELECT reserved_quota_bytes
+         FROM upload_sessions WHERE id = $1 AND state = 'uploading'",
     )
-    .bind(session)
-    .bind(upload_state)
-    .fetch_one(&mut **tx)
+    .bind(uuid_text(session))
+    .fetch_optional(&mut **tx)
     .await?;
+    let reserved = reserved.context("upload session is no longer active")?;
+    let updated = sqlx::query(
+        "UPDATE upload_sessions
+         SET state = $2, completed_at = $3, reserved_quota_bytes = 0
+         WHERE id = $1 AND state = 'uploading'",
+    )
+    .bind(uuid_text(session))
+    .bind(upload_state)
+    .bind(unix_now())
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("upload session is no longer active");
+    }
     sqlx::query(
         "UPDATE workspaces
-         SET reserved_bytes = GREATEST(0, reserved_bytes - $2)
+         SET reserved_bytes = max(0, reserved_bytes - $2)
          WHERE id = $1",
     )
-    .bind(workspace_id)
+    .bind(uuid_text(workspace_id))
     .bind(reserved)
     .execute(&mut **tx)
     .await?;
@@ -1456,7 +1555,7 @@ async fn finish_upload_in_transaction(
 }
 
 async fn release_upload(
-    pool: &PgPool,
+    pool: &SqlitePool,
     workspace_id: Uuid,
     session: Uuid,
     upload_state: &str,
@@ -1473,27 +1572,35 @@ async fn ensure_scope(
     principal_id: Uuid,
 ) -> Result<(Uuid, &'static str)> {
     let (kind, key) = parse_scope(requested)?;
-    let expires = if kind == "run" {
-        "now() + interval '7 days'"
+    let expires_at = if kind == "run" {
+        Some(unix_now() + 7 * 24 * 3600)
     } else {
-        "NULL"
+        None
     };
-    let query = format!(
+    let owner = if kind == "private" {
+        Some(uuid_text(principal_id))
+    } else {
+        None
+    };
+    let scope_id = Uuid::new_v4();
+    let id_text: String = sqlx::query_scalar(
         "INSERT INTO cache_scopes
-           (workspace_id, kind, external_scope_key, owner_principal_id, expires_at)
-         VALUES ($1, '{kind}', $2,
-           CASE WHEN '{kind}' = 'private' THEN $3 ELSE NULL END, {expires})
+           (id, workspace_id, kind, external_scope_key, owner_principal_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (workspace_id, kind, external_scope_key)
-         DO UPDATE SET external_scope_key = EXCLUDED.external_scope_key
-         RETURNING id"
-    );
-    let id = sqlx::query_scalar(&query)
-        .bind(state.workspace_id)
-        .bind(key)
-        .bind(principal_id)
-        .fetch_one(&state.pool)
-        .await?;
-    Ok((id, kind))
+         DO UPDATE SET external_scope_key = excluded.external_scope_key,
+                       expires_at = excluded.expires_at
+         RETURNING id",
+    )
+    .bind(uuid_text(scope_id))
+    .bind(uuid_text(state.workspace_id))
+    .bind(kind)
+    .bind(key)
+    .bind(owner)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok((parse_uuid(&id_text)?, kind))
 }
 
 async fn authorize(
@@ -1520,10 +1627,9 @@ async fn authorize(
         return Err(StatusCode::UNAUTHORIZED.into_response());
     };
     let presented = blake3::hash(token.as_bytes());
-    let prefixes = [
-        token.chars().take(8).collect::<String>(),
-        token.chars().take(12).collect::<String>(),
-    ];
+    let prefix8 = token.chars().take(8).collect::<String>();
+    let prefix12 = token.chars().take(12).collect::<String>();
+    let now = unix_now();
     let candidates = match sqlx::query(
         "SELECT t.id, t.token_hash, t.capabilities, t.allowed_run_scope,
                 t.source_repository, t.source_ref, t.source_commit, t.source_run,
@@ -1531,14 +1637,16 @@ async fn authorize(
          FROM access_tokens t
          JOIN principals p ON p.id = t.principal_id
          JOIN workspaces w ON w.id = p.workspace_id
-         WHERE t.public_prefix = ANY($1)
-           AND p.workspace_id = $2
-           AND p.enabled AND w.enabled
+         WHERE t.public_prefix IN ($1, $2)
+           AND p.workspace_id = $3
+           AND p.enabled = 1 AND w.enabled = 1
            AND t.revoked_at IS NULL
-           AND (t.expires_at IS NULL OR t.expires_at > now())",
+           AND (t.expires_at IS NULL OR t.expires_at > $4)",
     )
-    .bind(prefixes.as_slice())
-    .bind(state.workspace_id)
+    .bind(prefix8)
+    .bind(prefix12)
+    .bind(uuid_text(state.workspace_id))
+    .bind(now)
     .fetch_all(&state.pool)
     .await
     {
@@ -1549,14 +1657,24 @@ async fn authorize(
     for candidate in candidates {
         let stored: Vec<u8> = candidate.get("token_hash");
         if stored.len() == 32 && bool::from(presented.as_bytes().ct_eq(stored.as_slice())) {
+            let capabilities = match decode_string_list(&candidate.get::<String, _>("capabilities"))
+            {
+                Ok(values) => values.into_iter().collect(),
+                Err(error) => return Err(internal_error(error)),
+            };
+            let principal_id = match parse_uuid(&candidate.get::<String, _>("principal_id")) {
+                Ok(id) => id,
+                Err(error) => return Err(internal_error(error)),
+            };
+            let token_id = match parse_uuid(&candidate.get::<String, _>("id")) {
+                Ok(id) => id,
+                Err(error) => return Err(internal_error(error)),
+            };
             authenticated = Some((
-                candidate.get::<Uuid, _>("id"),
+                token_id,
                 AuthContext {
-                    principal_id: candidate.get("principal_id"),
-                    capabilities: candidate
-                        .get::<Vec<String>, _>("capabilities")
-                        .into_iter()
-                        .collect(),
+                    principal_id,
+                    capabilities,
                     allowed_run_scope: candidate.get("allowed_run_scope"),
                     source_repository: candidate.get("source_repository"),
                     source_ref: candidate.get("source_ref"),
@@ -1570,8 +1688,9 @@ async fn authorize(
     let Some((token_id, auth)) = authenticated else {
         return Err(StatusCode::UNAUTHORIZED.into_response());
     };
-    let _ = sqlx::query("UPDATE access_tokens SET last_used_at = now() WHERE id = $1")
-        .bind(token_id)
+    let _ = sqlx::query("UPDATE access_tokens SET last_used_at = $2 WHERE id = $1")
+        .bind(uuid_text(token_id))
+        .bind(now)
         .execute(&state.pool)
         .await;
     let scope = header_string(headers, HEADER_SCOPE).unwrap_or_else(|| "shared".to_string());
@@ -1830,11 +1949,11 @@ async fn report_corruption(
           (principal_id, workspace_id, scope_id, operation, task_hash, result, request_id)
          VALUES ($1, $2, $3, 'corruption-report', $4, 'reported', $5)",
     )
-    .bind(auth.principal_id)
-    .bind(state.workspace_id)
-    .bind(scope_id)
+    .bind(uuid_text(auth.principal_id))
+    .bind(uuid_text(state.workspace_id))
+    .bind(scope_id.map(uuid_text))
     .bind(task_hash)
-    .bind(Uuid::new_v4())
+    .bind(header_string(&headers, "x-request-id").unwrap_or_else(|| uuid_text(Uuid::new_v4())))
     .execute(&state.pool)
     .await
     {
@@ -1961,5 +2080,261 @@ mod tests {
         let error = validate_bundle(file.path(), &"a".repeat(64), &"b".repeat(64), 1024)
             .expect_err("duplicate paths must be rejected");
         assert!(error.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn string_list_json_round_trips() {
+        let values = vec![
+            "cache:shared:read".to_string(),
+            "cache:run:write".to_string(),
+            "refs/heads/main".to_string(),
+        ];
+        let encoded = encode_string_list(&values).unwrap();
+        assert_eq!(
+            encoded,
+            r#"["cache:shared:read","cache:run:write","refs/heads/main"]"#
+        );
+        assert_eq!(decode_string_list(&encoded).unwrap(), values);
+        assert_eq!(decode_string_list("[]").unwrap(), Vec::<String>::new());
+        assert!(decode_string_list("not-json").is_err());
+        assert!(decode_string_list(r#"[1,2]"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_applies_and_persists_json_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        let database_url = format!("sqlite:{}", db_path.display());
+        let pool = connect_pool(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let workspace_id = Uuid::new_v4();
+        let rule_id = Uuid::new_v4();
+        let capabilities = vec![
+            "cache:shared:read".to_string(),
+            "cache:shared:write".to_string(),
+            "cache:run:read".to_string(),
+            "cache:run:write".to_string(),
+        ];
+        let trusted_refs = vec!["refs/heads/main".to_string()];
+        let trusted_environments: Vec<String> = Vec::new();
+
+        sqlx::query(
+            "INSERT INTO workspaces (id, slug, maximum_entry_size)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(uuid_text(workspace_id))
+        .bind("wooli")
+        .bind(1024_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO oidc_trust_rules
+               (id, workspace_id, issuer, audience, repository_owner_id, repository_id,
+                reusable_workflow_ref, trusted_refs, trusted_environments, capabilities)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(uuid_text(rule_id))
+        .bind(uuid_text(workspace_id))
+        .bind("https://token.actions.githubusercontent.com")
+        .bind("https://cache.example.internal")
+        .bind("1234567")
+        .bind("7654321")
+        .bind(".github/workflows/ci.yml@refs/heads/main")
+        .bind(encode_string_list(&trusted_refs).unwrap())
+        .bind(encode_string_list(&trusted_environments).unwrap())
+        .bind(encode_string_list(&capabilities).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query(
+            "SELECT trusted_refs, trusted_environments, capabilities
+             FROM oidc_trust_rules WHERE id = $1",
+        )
+        .bind(uuid_text(rule_id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            decode_string_list(&row.get::<String, _>("trusted_refs")).unwrap(),
+            trusted_refs
+        );
+        assert_eq!(
+            decode_string_list(&row.get::<String, _>("trusted_environments")).unwrap(),
+            trusted_environments
+        );
+        assert_eq!(
+            decode_string_list(&row.get::<String, _>("capabilities")).unwrap(),
+            capabilities
+        );
+
+        // Foreign keys must be enforced with the configured pool options.
+        let orphan = sqlx::query(
+            "INSERT INTO principals
+               (id, workspace_id, kind, external_subject, display_name)
+             VALUES ($1, $2, 'service', 'missing-workspace', 'bad')",
+        )
+        .bind(uuid_text(Uuid::new_v4()))
+        .bind(uuid_text(Uuid::new_v4()))
+        .execute(&pool)
+        .await;
+        assert!(orphan.is_err());
+    }
+
+    #[tokio::test]
+    async fn first_writer_wins_and_quota_release_are_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        let database_url = format!("sqlite:{}", db_path.display());
+        let pool = connect_pool(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let workspace_id = Uuid::new_v4();
+        let principal_id = Uuid::new_v4();
+        let scope_id = Uuid::new_v4();
+        let now = unix_now();
+
+        sqlx::query(
+            "INSERT INTO workspaces
+               (id, slug, maximum_entry_size, total_storage_quota, reserved_bytes)
+             VALUES ($1, 'wooli', 1024, 10000, 0)",
+        )
+        .bind(uuid_text(workspace_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO principals
+               (id, workspace_id, kind, external_subject, display_name)
+             VALUES ($1, $2, 'service', 'test', 'test')",
+        )
+        .bind(uuid_text(principal_id))
+        .bind(uuid_text(workspace_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cache_scopes
+               (id, workspace_id, kind, external_scope_key)
+             VALUES ($1, $2, 'shared', 'shared')",
+        )
+        .bind(uuid_text(scope_id))
+        .bind(uuid_text(workspace_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let session = Uuid::new_v4();
+        sqlx::query("UPDATE workspaces SET reserved_bytes = 500 WHERE id = $1")
+            .bind(uuid_text(workspace_id))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_sessions
+               (id, workspace_id, scope_id, principal_id, task_hash, object_key,
+                expected_byte_length, reserved_quota_bytes, state, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 500, 500, 'uploading', $7)",
+        )
+        .bind(uuid_text(session))
+        .bind(uuid_text(workspace_id))
+        .bind(uuid_text(scope_id))
+        .bind(uuid_text(principal_id))
+        .bind("a".repeat(64))
+        .bind("objects/test.bundle")
+        .bind(now + 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        release_upload(&pool, workspace_id, session, "complete")
+            .await
+            .unwrap();
+        let reserved: i64 =
+            sqlx::query_scalar("SELECT reserved_bytes FROM workspaces WHERE id = $1")
+                .bind(uuid_text(workspace_id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reserved, 0);
+        let state: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id = $1")
+            .bind(uuid_text(session))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "complete");
+
+        let blob_a = Uuid::new_v4();
+        let blob_b = Uuid::new_v4();
+        let task_hash = "b".repeat(64);
+        for (blob_id, key) in [(blob_a, "objects/a.bundle"), (blob_b, "objects/b.bundle")] {
+            sqlx::query(
+                "INSERT INTO blobs
+                   (id, workspace_id, bundle_digest, object_key, compressed_byte_length, state)
+                 VALUES ($1, $2, $3, $4, 10, 'available')",
+            )
+            .bind(uuid_text(blob_id))
+            .bind(uuid_text(workspace_id))
+            .bind(format!("digest-{key}"))
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let first = sqlx::query(
+            "INSERT INTO cache_entries
+               (id, workspace_id, scope_id, protocol_version, cache_schema_version, task_hash,
+                result_digest, blob_id, producer_principal_id)
+             VALUES ($1, $2, $3, $4, $5, $6, 'result-a', $7, $8)
+             ON CONFLICT (workspace_id, scope_id, protocol_version, task_hash) DO NOTHING",
+        )
+        .bind(uuid_text(Uuid::new_v4()))
+        .bind(uuid_text(workspace_id))
+        .bind(uuid_text(scope_id))
+        .bind(PROTOCOL_VERSION)
+        .bind(CACHE_SCHEMA_VERSION)
+        .bind(&task_hash)
+        .bind(uuid_text(blob_a))
+        .bind(uuid_text(principal_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first.rows_affected(), 1);
+
+        let second = sqlx::query(
+            "INSERT INTO cache_entries
+               (id, workspace_id, scope_id, protocol_version, cache_schema_version, task_hash,
+                result_digest, blob_id, producer_principal_id)
+             VALUES ($1, $2, $3, $4, $5, $6, 'result-b', $7, $8)
+             ON CONFLICT (workspace_id, scope_id, protocol_version, task_hash) DO NOTHING",
+        )
+        .bind(uuid_text(Uuid::new_v4()))
+        .bind(uuid_text(workspace_id))
+        .bind(uuid_text(scope_id))
+        .bind(PROTOCOL_VERSION)
+        .bind(CACHE_SCHEMA_VERSION)
+        .bind(&task_hash)
+        .bind(uuid_text(blob_b))
+        .bind(uuid_text(principal_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(second.rows_affected(), 0);
+
+        let winner: String = sqlx::query_scalar(
+            "SELECT result_digest FROM cache_entries
+             WHERE workspace_id = $1 AND task_hash = $2",
+        )
+        .bind(uuid_text(workspace_id))
+        .bind(&task_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(winner, "result-a");
     }
 }

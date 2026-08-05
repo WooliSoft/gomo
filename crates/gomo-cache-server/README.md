@@ -1,8 +1,9 @@
 # Gomo cache server
 
-The cache server keeps publication and authorization in PostgreSQL and stores
-immutable bundle bytes in an S3-compatible bucket. Clients receive only an HTTP
-bearer token; do not distribute the S3 key.
+The cache server keeps publication and authorization in a local SQLite database
+and stores immutable bundle bytes in an S3-compatible bucket. It is intended to
+run as a single server process. Clients receive only an HTTP bearer token; do
+not distribute the S3 key.
 
 This server is intended for infra deployments, not local devenv. Local Garage
 from `devenv up -d` is for apps and tests; point a deployed cache server at its
@@ -14,7 +15,7 @@ deployed Garage/S3 endpoint; `http://127.0.0.1:3900` is only valid when Garage
 runs on the same host as the cache server.
 
 ```sh
-export GOMO_CACHE_DATABASE_URL="$DATABASE_URL"
+export GOMO_CACHE_DATABASE_URL=sqlite:///var/lib/gomo-cache/gomo-cache.db
 export GOMO_CACHE_WORKSPACE=wooli
 export GOMO_CACHE_LISTEN=0.0.0.0:7788
 export GOMO_CACHE_TOKEN="a-generated-high-entropy-token"
@@ -30,6 +31,12 @@ cargo run -p gomo-cache-server -- doctor
 cargo run -p gomo-cache-server -- serve
 ```
 
+The database defaults to `sqlite://gomo-cache.db` in the current directory.
+Set an absolute URL in deployments and persist the database file together with
+its `-wal` and `-shm` files. SQLite uses exclusive locking, so only one server or
+administration command can access the database at a time. Stop `serve` before
+running `migrate`, `doctor`, or `gc`.
+
 Never commit Garage credentials or bearer tokens. The runtime Garage key should
 only read and write this bucket.
 
@@ -42,21 +49,22 @@ owner/repository IDs are required:
 
 ```sql
 INSERT INTO oidc_trust_rules (
-  workspace_id, issuer, audience, repository_owner_id, repository_id,
+  id, workspace_id, issuer, audience, repository_owner_id, repository_id,
   reusable_workflow_ref, trusted_refs, trusted_environments, capabilities
 )
-SELECT id,
+SELECT lower(printf(
+    '%s-%s-%s-%s-%s',
+    hex(randomblob(4)), hex(randomblob(2)), hex(randomblob(2)),
+    hex(randomblob(2)), hex(randomblob(6))
+  )), id,
   'https://token.actions.githubusercontent.com',
   'https://cache.example.internal',
   '1234567',
   '7654321',
   '.github/workflows/ci.yml@refs/heads/main',
-  ARRAY['refs/heads/main'],
-  ARRAY[]::text[],
-  ARRAY[
-    'cache:shared:read', 'cache:shared:write',
-    'cache:run:read', 'cache:run:write'
-  ]
+  '["refs/heads/main"]',
+  '[]',
+  '["cache:shared:read","cache:shared:write","cache:run:read","cache:run:write"]'
 FROM workspaces WHERE slug = 'wooli';
 ```
 
@@ -68,7 +76,7 @@ receive shared read plus read/write access only to
 `run:<repository-id>:<run-id>:<run-attempt>`. Set
 `GOMO_CACHE_OIDC_JWKS_URL` only for a controlled test issuer.
 
-Published-object retention must be database-driven. Do not attach a blind
+Published-object retention must be SQLite-driven. Do not attach a blind
 expiration policy to `objects/`; Garage has no object versioning or object lock
 to recover accidentally expired objects. Lifecycle rules may abort incomplete
 multipart uploads.

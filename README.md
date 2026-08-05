@@ -332,10 +332,12 @@ gomo-cache-server doctor
 gomo-cache-server serve
 ```
 
-It uses PostgreSQL as the first-writer-wins publication authority and an
-S3-compatible bucket only for immutable bundle bytes. Garage is supported with
-region `garage`, a custom endpoint, and path-style addressing. Clients never
-receive bucket credentials.
+It uses a local SQLite database as the first-writer-wins publication authority
+and an S3-compatible bucket only for immutable bundle bytes. The cache server is
+single-process by design; SQLite uses exclusive locking to prevent a second
+server or administration command from opening the database concurrently.
+Garage is supported with region `garage`, a custom endpoint, and path-style
+addressing. Clients never receive bucket credentials.
 
 ## CI Workflows
 
