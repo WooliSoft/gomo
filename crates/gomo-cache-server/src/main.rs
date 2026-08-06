@@ -35,13 +35,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, S
 use sqlx::{Row, Sqlite, SqlitePool};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, oneshot};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
 const DEFAULT_DATABASE_URL: &str = "sqlite://gomo-cache.db";
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Parser)]
 #[command(name = "gomo-cache-server", version)]
@@ -75,38 +76,27 @@ struct Config {
     secret_access_key: String,
     session_token: Option<String>,
     force_path_style: bool,
-    token: String,
-    capabilities: BTreeSet<String>,
+    read_token: String,
+    write_token: String,
     max_entry_size_bytes: u64,
-    allowed_run_id: Option<String>,
     oidc_issuer: String,
     oidc_jwks_url: String,
     oidc_token_ttl_seconds: i64,
+    gc_interval_seconds: u64,
+    gc_batch_size: i64,
 }
 
 impl Config {
     fn load() -> Result<Self> {
+        let read_token = required("GOMO_CACHE_READ_TOKEN")?;
+        let write_token = required("GOMO_CACHE_WRITE_TOKEN")?;
+        if read_token == write_token {
+            bail!("GOMO_CACHE_READ_TOKEN and GOMO_CACHE_WRITE_TOKEN must differ");
+        }
         let listen = env::var("GOMO_CACHE_LISTEN")
             .unwrap_or_else(|_| "127.0.0.1:7788".to_string())
             .parse()
             .context("GOMO_CACHE_LISTEN must be a socket address")?;
-        let capabilities = env::var("GOMO_CACHE_CAPABILITIES")
-            .unwrap_or_else(|_| {
-                [
-                    "cache:shared:read",
-                    "cache:shared:write",
-                    "cache:run:read",
-                    "cache:run:write",
-                    "cache:private:read",
-                    "cache:private:write",
-                ]
-                .join(",")
-            })
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect();
         Ok(Self {
             database_url: env::var("GOMO_CACHE_DATABASE_URL")
                 .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string()),
@@ -122,13 +112,12 @@ impl Config {
             force_path_style: env::var("GOMO_CACHE_S3_FORCE_PATH_STYLE")
                 .map(|value| value != "false")
                 .unwrap_or(true),
-            token: required("GOMO_CACHE_TOKEN")?,
-            capabilities,
+            read_token,
+            write_token,
             max_entry_size_bytes: env::var("GOMO_CACHE_MAX_ENTRY_SIZE_BYTES")
                 .unwrap_or_else(|_| "10737418240".to_string())
                 .parse()
                 .context("GOMO_CACHE_MAX_ENTRY_SIZE_BYTES must be an integer")?,
-            allowed_run_id: env::var("GOMO_CACHE_ALLOWED_RUN_ID").ok(),
             oidc_issuer: env::var("GOMO_CACHE_OIDC_ISSUER")
                 .unwrap_or_else(|_| "https://token.actions.githubusercontent.com".to_string()),
             oidc_jwks_url: env::var("GOMO_CACHE_OIDC_JWKS_URL").unwrap_or_else(|_| {
@@ -138,12 +127,23 @@ impl Config {
                 .unwrap_or_else(|_| "900".to_string())
                 .parse()
                 .context("GOMO_CACHE_OIDC_TOKEN_TTL_SECONDS must be an integer")?,
+            gc_interval_seconds: env::var("GOMO_CACHE_GC_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .context("GOMO_CACHE_GC_INTERVAL_SECONDS must be an integer")?,
+            gc_batch_size: env::var("GOMO_CACHE_GC_BATCH_SIZE")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("GOMO_CACHE_GC_BATCH_SIZE must be an integer")?,
         })
     }
 }
 
 fn required(name: &str) -> Result<String> {
-    env::var(name).with_context(|| format!("{name} is required"))
+    match env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        _ => bail!("{name} is required and must not be empty"),
+    }
 }
 
 fn unix_now() -> i64 {
@@ -198,11 +198,7 @@ async fn connect_pool(database_url: &str) -> Result<SqlitePool> {
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    sqlx::migrate::Migrator::new(path.as_path())
-        .await?
-        .run(pool)
-        .await?;
+    MIGRATOR.run(pool).await?;
     Ok(())
 }
 
@@ -416,6 +412,28 @@ async fn garbage_collect(state: &AppState, batch_size: i64) -> Result<u64> {
     Ok(removed)
 }
 
+async fn run_periodic_gc(
+    state: Arc<AppState>,
+    interval_seconds: u64,
+    batch_size: i64,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds.max(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = interval.tick() => {}
+        }
+        match garbage_collect(&state, batch_size).await {
+            Ok(removed) => info!(removed, "garbage collection complete"),
+            Err(error) => error!(%error, "garbage collection failed"),
+        }
+    }
+}
+
 async fn expire_upload_sessions(state: &AppState, batch_size: i64) -> Result<Vec<String>> {
     let mut tx = state.pool.begin().await?;
     let now = unix_now();
@@ -598,6 +616,87 @@ async fn upload_object(
     upload_result
 }
 
+async fn upsert_static_token(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+    token: &str,
+    external_subject: &str,
+    display_name: &str,
+    capabilities: &[&str],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let principal_id = Uuid::new_v4();
+    let principal_id_text: String = sqlx::query_scalar(
+        "INSERT INTO principals (id, workspace_id, kind, external_subject, display_name)
+         VALUES ($1, $2, 'service', $3, $4)
+         ON CONFLICT (workspace_id, kind, external_subject)
+         DO UPDATE SET enabled = 1, display_name = excluded.display_name, last_seen_at = $5
+         RETURNING id",
+    )
+    .bind(uuid_text(principal_id))
+    .bind(uuid_text(workspace_id))
+    .bind(external_subject)
+    .bind(display_name)
+    .bind(unix_now())
+    .fetch_one(&mut *tx)
+    .await?;
+    let principal_id = parse_uuid(&principal_id_text)?;
+    let token_hash = *blake3::hash(token.as_bytes()).as_bytes();
+    sqlx::query("DELETE FROM access_tokens WHERE principal_id = $1 AND token_hash <> $2")
+        .bind(uuid_text(principal_id))
+        .bind(token_hash.as_slice())
+        .execute(&mut *tx)
+        .await?;
+    let capabilities = capabilities
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "INSERT INTO access_tokens
+           (id, public_prefix, principal_id, token_hash, capabilities, allowed_run_scope)
+         VALUES ($1, $2, $3, $4, $5, NULL)
+         ON CONFLICT (token_hash) DO UPDATE
+         SET public_prefix = excluded.public_prefix, principal_id = excluded.principal_id,
+             revoked_at = NULL, capabilities = excluded.capabilities,
+             allowed_run_scope = excluded.allowed_run_scope",
+    )
+    .bind(uuid_text(Uuid::new_v4()))
+    .bind(token.chars().take(8).collect::<String>())
+    .bind(uuid_text(principal_id))
+    .bind(token_hash.as_slice())
+    .bind(encode_string_list(&capabilities)?)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn disable_legacy_static_token(pool: &SqlitePool, workspace_id: Uuid) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE access_tokens SET revoked_at = COALESCE(revoked_at, $2)
+         WHERE principal_id IN (
+           SELECT id FROM principals
+           WHERE workspace_id = $1 AND kind = 'service'
+             AND external_subject = 'bootstrap-static-token'
+         )",
+    )
+    .bind(uuid_text(workspace_id))
+    .bind(unix_now())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE principals SET enabled = 0
+         WHERE workspace_id = $1 AND kind = 'service'
+           AND external_subject = 'bootstrap-static-token'",
+    )
+    .bind(uuid_text(workspace_id))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn serve(config: Config, pool: SqlitePool) -> Result<()> {
     run_migrations(&pool).await?;
     let workspace_id = Uuid::new_v4();
@@ -613,40 +712,24 @@ async fn serve(config: Config, pool: SqlitePool) -> Result<()> {
     .fetch_one(&pool)
     .await?;
     let workspace_id = parse_uuid(&workspace_id_text)?;
-    let principal_id = Uuid::new_v4();
-    let principal_id_text: String = sqlx::query_scalar(
-        "INSERT INTO principals (id, workspace_id, kind, external_subject, display_name)
-         VALUES ($1, $2, 'service', 'bootstrap-static-token', 'static cache token')
-         ON CONFLICT (workspace_id, kind, external_subject)
-         DO UPDATE SET enabled = 1, last_seen_at = $3
-         RETURNING id",
+    disable_legacy_static_token(&pool, workspace_id).await?;
+    upsert_static_token(
+        &pool,
+        workspace_id,
+        &config.read_token,
+        "bootstrap-read-token",
+        "static read-only cache token",
+        &["cache:shared:read"],
     )
-    .bind(uuid_text(principal_id))
-    .bind(uuid_text(workspace_id))
-    .bind(unix_now())
-    .fetch_one(&pool)
     .await?;
-    let principal_id = parse_uuid(&principal_id_text)?;
-    let token_hash = *blake3::hash(config.token.as_bytes()).as_bytes();
-    let public_prefix = config.token.chars().take(8).collect::<String>();
-    let capability_values = config.capabilities.iter().cloned().collect::<Vec<_>>();
-    let capabilities_json = encode_string_list(&capability_values)?;
-    let token_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO access_tokens
-           (id, public_prefix, principal_id, token_hash, capabilities, allowed_run_scope)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (token_hash) DO UPDATE
-         SET revoked_at = NULL, capabilities = excluded.capabilities,
-             allowed_run_scope = excluded.allowed_run_scope",
+    upsert_static_token(
+        &pool,
+        workspace_id,
+        &config.write_token,
+        "bootstrap-write-token",
+        "static read-write cache token",
+        &["cache:shared:read", "cache:shared:write"],
     )
-    .bind(uuid_text(token_id))
-    .bind(public_prefix)
-    .bind(uuid_text(principal_id))
-    .bind(token_hash.as_slice())
-    .bind(capabilities_json)
-    .bind(config.allowed_run_id.as_deref())
-    .execute(&pool)
     .await?;
     let state = Arc::new(AppState {
         s3: s3_client(&config).await,
@@ -656,6 +739,9 @@ async fn serve(config: Config, pool: SqlitePool) -> Result<()> {
         metrics: Arc::new(Metrics::default()),
         oidc: Arc::new(OidcState::default()),
     });
+    let gc_state = Arc::clone(&state);
+    let gc_interval_seconds = config.gc_interval_seconds;
+    let gc_batch_size = config.gc_batch_size;
     let app = Router::new()
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready))
@@ -676,14 +762,43 @@ async fn serve(config: Config, pool: SqlitePool) -> Result<()> {
         .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, "Gomo cache server listening");
-    axum::serve(listener, app)
+    let (gc_shutdown, gc_shutdown_signal) = oneshot::channel();
+    let gc_task = tokio::spawn(run_periodic_gc(
+        gc_state,
+        gc_interval_seconds,
+        gc_batch_size,
+        gc_shutdown_signal,
+    ));
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    let _ = gc_shutdown.send(());
+    if let Err(error) = gc_task.await {
+        error!(%error, "garbage collection task failed during shutdown");
+    }
+    result?;
     Ok(())
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        signal.recv().await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> Response {
@@ -735,7 +850,7 @@ fn authorized_metrics_token(state: &AppState, headers: &HeaderMap) -> bool {
         return false;
     };
     let presented = blake3::hash(token.as_bytes());
-    let expected = blake3::hash(state.config.token.as_bytes());
+    let expected = blake3::hash(state.config.write_token.as_bytes());
     bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
 }
 
@@ -2183,6 +2298,123 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(orphan.is_err());
+    }
+
+    #[tokio::test]
+    async fn static_tokens_have_fixed_capabilities_and_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        let database_url = format!("sqlite:{}", db_path.display());
+        let pool = connect_pool(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces (id, slug) VALUES ($1, $2)")
+            .bind(uuid_text(workspace_id))
+            .bind("wooli")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let legacy_principal_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO principals
+               (id, workspace_id, kind, external_subject, display_name)
+             VALUES ($1, $2, 'service', 'bootstrap-static-token', 'legacy token')",
+        )
+        .bind(uuid_text(legacy_principal_id))
+        .bind(uuid_text(workspace_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO access_tokens
+               (id, public_prefix, principal_id, token_hash, capabilities)
+             VALUES ($1, 'legacy', $2, $3, $4)",
+        )
+        .bind(uuid_text(Uuid::new_v4()))
+        .bind(uuid_text(legacy_principal_id))
+        .bind(blake3::hash(b"legacy-token").as_bytes().as_slice())
+        .bind(encode_string_list(&["cache:shared:write".to_string()]).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        disable_legacy_static_token(&pool, workspace_id)
+            .await
+            .unwrap();
+
+        upsert_static_token(
+            &pool,
+            workspace_id,
+            "old-read-token",
+            "bootstrap-read-token",
+            "static read-only cache token",
+            &["cache:shared:read"],
+        )
+        .await
+        .unwrap();
+        upsert_static_token(
+            &pool,
+            workspace_id,
+            "new-read-token",
+            "bootstrap-read-token",
+            "static read-only cache token",
+            &["cache:shared:read"],
+        )
+        .await
+        .unwrap();
+        upsert_static_token(
+            &pool,
+            workspace_id,
+            "write-token",
+            "bootstrap-write-token",
+            "static read-write cache token",
+            &["cache:shared:read", "cache:shared:write"],
+        )
+        .await
+        .unwrap();
+
+        let rows = sqlx::query(
+            "SELECT p.external_subject, t.token_hash, t.capabilities
+             FROM access_tokens t
+             JOIN principals p ON p.id = t.principal_id
+             WHERE p.enabled = 1 AND t.revoked_at IS NULL
+             ORDER BY p.external_subject",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get::<String, _>("external_subject"),
+            "bootstrap-read-token"
+        );
+        assert_eq!(
+            rows[0].get::<Vec<u8>, _>("token_hash"),
+            blake3::hash(b"new-read-token").as_bytes()
+        );
+        assert_eq!(
+            decode_string_list(&rows[0].get::<String, _>("capabilities")).unwrap(),
+            vec!["cache:shared:read"]
+        );
+        assert_eq!(
+            rows[1].get::<String, _>("external_subject"),
+            "bootstrap-write-token"
+        );
+        assert_eq!(
+            decode_string_list(&rows[1].get::<String, _>("capabilities")).unwrap(),
+            vec!["cache:shared:read", "cache:shared:write"]
+        );
+        let legacy = sqlx::query(
+            "SELECT p.enabled, t.revoked_at
+             FROM access_tokens t
+             JOIN principals p ON p.id = t.principal_id
+             WHERE p.external_subject = 'bootstrap-static-token'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy.get::<i64, _>("enabled"), 0);
+        assert!(legacy.get::<Option<i64>, _>("revoked_at").is_some());
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "gomo-cache-server"
-version = "0.1.0"
+version = "1.8.0"
 edition = "2024"
 description = "Authenticated immutable HTTP cache service for Gomo"
 
@@ -22,6 +22,7 @@ sqlx = { version = "0.8.6", default-features = false, features = [
   "runtime-tokio-rustls",
   "sqlite",
   "migrate",
+  "macros",
 ] }
 subtle = "2.6.1"
 tar = "0.4.44"

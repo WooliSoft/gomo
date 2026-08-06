@@ -18,7 +18,8 @@ runs on the same host as the cache server.
 export GOMO_CACHE_DATABASE_URL=sqlite:///var/lib/gomo-cache/gomo-cache.db
 export GOMO_CACHE_WORKSPACE=wooli
 export GOMO_CACHE_LISTEN=0.0.0.0:7788
-export GOMO_CACHE_TOKEN="a-generated-high-entropy-token"
+export GOMO_CACHE_READ_TOKEN="a-generated-read-only-token"
+export GOMO_CACHE_WRITE_TOKEN="a-different-generated-read-write-token"
 export GOMO_CACHE_S3_BUCKET=gomo-cache
 export GOMO_CACHE_S3_ENDPOINT=https://garage.example.internal
 export GOMO_CACHE_S3_REGION=garage
@@ -35,14 +36,18 @@ The database defaults to `sqlite://gomo-cache.db` in the current directory.
 Set an absolute URL in deployments and persist the database file together with
 its `-wal` and `-shm` files. SQLite uses exclusive locking, so only one server or
 administration command can access the database at a time. Stop `serve` before
-running `migrate`, `doctor`, or `gc`.
+running `migrate`, `doctor`, or a one-off `gc`. `serve` embeds and applies its
+migrations at startup and runs garbage collection in-process every hour. Set
+`GOMO_CACHE_GC_INTERVAL_SECONDS` and `GOMO_CACHE_GC_BATCH_SIZE` to change that
+schedule.
 
 Never commit Garage credentials or bearer tokens. The runtime Garage key should
 only read and write this bucket.
 
-`GOMO_CACHE_CAPABILITIES` is a comma-separated capability list. A protected CI
-token may include `cache:shared:write`; developer and pull-request identities
-should omit it. Run-scoped clients set `GOMO_REMOTE_CACHE_RUN_ID`.
+The read token receives only `cache:shared:read`. The write token receives
+`cache:shared:read` and `cache:shared:write`; reserve it for protected CI. The
+write token also authorizes the metrics endpoint. Run-scoped clients set
+`GOMO_REMOTE_CACHE_RUN_ID`.
 
 For GitHub OIDC, insert a trust rule after migration. Immutable repository
 owner/repository IDs are required:
