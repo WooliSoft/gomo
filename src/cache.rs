@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v6";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = "v7";
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -1083,6 +1083,10 @@ struct CacheEntryMetadata {
     output_archive: Option<CacheArtifactMetadata>,
     result_digest: String,
     created_at_unix_seconds: u64,
+    /// Absolute workspace root where the cached build outputs were produced.
+    /// Used to relocate Gleam artefacts that embed absolute source paths.
+    #[serde(default)]
+    workspace_root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1189,6 +1193,7 @@ pub(crate) fn write_named_task_metadata(
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0),
+        workspace_root: String::new(),
     };
     let mut json = serde_json::to_vec_pretty(&metadata)?;
     json.push(b'\n');
@@ -1778,8 +1783,15 @@ pub(crate) fn restore_successful_build(
         return Ok(None);
     }
 
+    let metadata = read_cache_entry_metadata(&entry_dir.join("meta.json"))?;
     let archive_path = entry_dir.join("outputs.tar.zst");
     restore_build_outputs(project, task_hash, &archive_path)?;
+    relocate_restored_build_outputs(
+        workspace,
+        project,
+        &task_hash.cached_folders,
+        &metadata.workspace_root,
+    )?;
 
     Ok(Some(CachedTaskExecution {
         stdout: read_optional_string(&entry_dir.join("stdout.txt"))?,
@@ -1895,6 +1907,7 @@ pub(crate) fn store_successful_build(
         let hash_manifest = write_hash_manifest(&temp_dir.join("hash-manifest.json"), task_hash)?;
         write_cache_metadata(
             &temp_dir.join("meta.json"),
+            workspace,
             task_hash,
             stdout,
             stderr,
@@ -2008,6 +2021,7 @@ fn store_successful_output_task(
         let hash_manifest = write_hash_manifest(&temp_dir.join("hash-manifest.json"), task_hash)?;
         write_cache_metadata(
             &temp_dir.join("meta.json"),
+            workspace,
             task_hash,
             stdout,
             stderr,
@@ -2046,6 +2060,7 @@ fn write_cache_text_artifact(path: &Path, contents: &str) -> Result<CacheArtifac
 
 fn write_cache_metadata(
     path: &Path,
+    workspace: &Workspace,
     task_hash: &TaskHash,
     stdout: CacheArtifactMetadata,
     stderr: CacheArtifactMetadata,
@@ -2053,6 +2068,7 @@ fn write_cache_metadata(
     output_archive: Option<CacheArtifactMetadata>,
 ) -> Result<()> {
     let metadata = CacheEntryMetadata::from_task_hash(
+        workspace,
         task_hash,
         stdout,
         stderr,
@@ -2062,6 +2078,13 @@ fn write_cache_metadata(
     let metadata_json =
         serde_json::to_string_pretty(&metadata).context("failed to serialize cache metadata")?;
     fs::write(path, metadata_json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_cache_entry_metadata(path: &Path) -> Result<CacheEntryMetadata> {
+    let metadata_text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&metadata_text)
+        .with_context(|| format!("invalid cache metadata {}", path.display()))
 }
 
 fn write_hash_manifest(path: &Path, task_hash: &TaskHash) -> Result<CacheArtifactMetadata> {
@@ -2249,6 +2272,7 @@ fn task_cache_identity_dir(workspace: &Workspace, identity: &str) -> PathBuf {
 
 impl CacheEntryMetadata {
     fn from_task_hash(
+        workspace: &Workspace,
         task_hash: &TaskHash,
         stdout: CacheArtifactMetadata,
         stderr: CacheArtifactMetadata,
@@ -2289,6 +2313,7 @@ impl CacheEntryMetadata {
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
+            workspace_root: absolute_workspace_root(workspace),
         }
     }
 
@@ -3017,6 +3042,206 @@ fn install_restored_build_outputs(
 
     remove_path(&backup_root)?;
     Ok(())
+}
+
+fn relocate_restored_build_outputs(
+    workspace: &Workspace,
+    project: &Project,
+    cached_folders: &[String],
+    stored_workspace_root: &str,
+) -> Result<()> {
+    if stored_workspace_root.is_empty() {
+        return Ok(());
+    }
+
+    let current_root = absolute_workspace_root(workspace);
+    if stored_workspace_root == current_root {
+        return Ok(());
+    }
+
+    let old_root = stored_workspace_root.as_bytes();
+    let new_root = current_root.as_bytes();
+    for folder in cached_folders {
+        let root = project.root.join(folder);
+        if !root.exists() {
+            continue;
+        }
+        relocate_workspace_paths_in_tree(&root, old_root, new_root)?;
+    }
+    Ok(())
+}
+
+fn absolute_workspace_root(workspace: &Workspace) -> String {
+    let root = workspace
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone());
+    root.to_string_lossy().replace('\\', "/")
+}
+
+fn relocate_workspace_paths_in_tree(root: &Path, old_root: &[u8], new_root: &[u8]) -> Result<()> {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.file_type().is_file() || entry.file_type().is_dir())
+    {
+        let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let original =
+            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        if find_bytes(&original, old_root).is_none() {
+            continue;
+        }
+        let relocated = relocate_embedded_workspace_paths(&original, old_root, new_root);
+        if relocated != original {
+            fs::write(path, relocated)
+                .with_context(|| format!("failed to rewrite {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedPathEncoding {
+    GleamU64Le,
+    ErlangStringExt,
+    ErlangBinaryExt,
+    Raw,
+}
+
+fn relocate_embedded_workspace_paths(data: &[u8], old_root: &[u8], new_root: &[u8]) -> Vec<u8> {
+    if old_root.is_empty() || old_root == new_root {
+        return data.to_vec();
+    }
+
+    let mut output = Vec::with_capacity(data.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = find_bytes(&data[cursor..], old_root) {
+        let path_start = cursor + relative;
+        let (path_len, encoding, prefix_len) = match embedded_path_at(data, path_start, old_root) {
+            Some(value) => value,
+            None => {
+                output.extend_from_slice(&data[cursor..path_start + old_root.len()]);
+                cursor = path_start + old_root.len();
+                continue;
+            }
+        };
+
+        let copy_end = path_start.saturating_sub(prefix_len);
+        output.extend_from_slice(&data[cursor..copy_end]);
+
+        let old_path = &data[path_start..path_start + path_len];
+        let mut new_path = Vec::with_capacity(new_root.len() + path_len - old_root.len());
+        new_path.extend_from_slice(new_root);
+        new_path.extend_from_slice(&old_path[old_root.len()..]);
+        write_embedded_path_prefix(&mut output, encoding, new_path.len());
+        output.extend_from_slice(&new_path);
+        cursor = path_start + path_len;
+    }
+    output.extend_from_slice(&data[cursor..]);
+    output
+}
+
+fn embedded_path_at(
+    data: &[u8],
+    path_start: usize,
+    old_root: &[u8],
+) -> Option<(usize, EmbeddedPathEncoding, usize)> {
+    if path_start >= 8 {
+        let declared =
+            u64::from_le_bytes(data[path_start - 8..path_start].try_into().ok()?) as usize;
+        if let Some(path_len) = validated_embedded_path_len(data, path_start, declared, old_root) {
+            return Some((path_len, EmbeddedPathEncoding::GleamU64Le, 8));
+        }
+    }
+    if path_start >= 3 && data[path_start - 3] == b'k' {
+        let declared =
+            u16::from_be_bytes(data[path_start - 2..path_start].try_into().ok()?) as usize;
+        if let Some(path_len) = validated_embedded_path_len(data, path_start, declared, old_root) {
+            return Some((path_len, EmbeddedPathEncoding::ErlangStringExt, 3));
+        }
+    }
+    if path_start >= 5 && data[path_start - 5] == b'm' {
+        let declared =
+            u32::from_be_bytes(data[path_start - 4..path_start].try_into().ok()?) as usize;
+        if let Some(path_len) = validated_embedded_path_len(data, path_start, declared, old_root) {
+            return Some((path_len, EmbeddedPathEncoding::ErlangBinaryExt, 5));
+        }
+    }
+
+    let mut path_len = old_root.len();
+    while path_start + path_len < data.len() && is_embedded_path_byte(data[path_start + path_len]) {
+        path_len += 1;
+    }
+    Some((path_len, EmbeddedPathEncoding::Raw, 0))
+}
+
+fn validated_embedded_path_len(
+    data: &[u8],
+    path_start: usize,
+    declared: usize,
+    old_root: &[u8],
+) -> Option<usize> {
+    if declared < old_root.len() || path_start + declared > data.len() {
+        return None;
+    }
+    let path = &data[path_start..path_start + declared];
+    if !path.starts_with(old_root) || !path.iter().copied().all(is_embedded_path_byte) {
+        return None;
+    }
+    Some(declared)
+}
+
+fn write_embedded_path_prefix(output: &mut Vec<u8>, encoding: EmbeddedPathEncoding, len: usize) {
+    match encoding {
+        EmbeddedPathEncoding::GleamU64Le => {
+            output.extend_from_slice(&(len as u64).to_le_bytes());
+        }
+        EmbeddedPathEncoding::ErlangStringExt => {
+            output.push(b'k');
+            output.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        EmbeddedPathEncoding::ErlangBinaryExt => {
+            output.push(b'm');
+            output.extend_from_slice(&(len as u32).to_be_bytes());
+        }
+        EmbeddedPathEncoding::Raw => {}
+    }
+}
+
+fn is_embedded_path_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'\\'
+            | b'.'
+            | b'_'
+            | b'-'
+            | b'+'
+            | b'~'
+            | b' '
+            | b'@'
+    )
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -4225,6 +4450,147 @@ version = "0.1.0"
                 .expect("cache lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn relocates_length_prefixed_workspace_paths() {
+        let old_root = b"/data/work/oldjob/hostexecutor";
+        let new_root = b"/data/work/newjob/hostexecutor";
+        let old_path = b"/data/work/oldjob/hostexecutor/libs/shared/src/main.gleam";
+        let new_path = b"/data/work/newjob/hostexecutor/libs/shared/src/main.gleam";
+
+        let mut gleam = Vec::new();
+        gleam.extend_from_slice(b"hdr");
+        gleam.extend_from_slice(&(old_path.len() as u64).to_le_bytes());
+        gleam.extend_from_slice(old_path);
+        gleam.extend_from_slice(b"tail");
+
+        let mut beam_string = Vec::new();
+        beam_string.extend_from_slice(b"src");
+        beam_string.push(b'k');
+        beam_string.extend_from_slice(&(old_path.len() as u16).to_be_bytes());
+        beam_string.extend_from_slice(old_path);
+        beam_string.extend_from_slice(b"end");
+
+        let mut beam_binary = Vec::new();
+        beam_binary.push(b'm');
+        beam_binary.extend_from_slice(&(old_path.len() as u32).to_be_bytes());
+        beam_binary.extend_from_slice(old_path);
+
+        let gleam_out = relocate_embedded_workspace_paths(&gleam, old_root, new_root);
+        assert!(
+            gleam_out
+                .windows(new_path.len())
+                .any(|window| window == new_path)
+        );
+        assert!(find_bytes(&gleam_out, old_root).is_none());
+        assert_eq!(
+            u64::from_le_bytes(gleam_out[3..11].try_into().unwrap()) as usize,
+            new_path.len()
+        );
+
+        let beam_string_out = relocate_embedded_workspace_paths(&beam_string, old_root, new_root);
+        assert_eq!(beam_string_out[3], b'k');
+        assert_eq!(
+            u16::from_be_bytes(beam_string_out[4..6].try_into().unwrap()) as usize,
+            new_path.len()
+        );
+        assert!(
+            beam_string_out
+                .windows(new_path.len())
+                .any(|window| window == new_path)
+        );
+
+        let beam_binary_out = relocate_embedded_workspace_paths(&beam_binary, old_root, new_root);
+        assert_eq!(beam_binary_out[0], b'm');
+        assert_eq!(
+            u32::from_be_bytes(beam_binary_out[1..5].try_into().unwrap()) as usize,
+            new_path.len()
+        );
+        assert!(
+            beam_binary_out
+                .windows(new_path.len())
+                .any(|window| window == new_path)
+        );
+    }
+
+    #[test]
+    fn relocates_embedded_paths_when_restoring_build_outputs_across_roots() {
+        let test_workspace = TestWorkspace::new("gomo-cache-relocate-test");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "libs/shared",
+            r#"
+name = "shared"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_file("libs/shared/src/main.gleam", "pub fn value() { 1 }\n");
+        let (workspace, graph) = load_workspace(&test_workspace);
+        let shared = project(&workspace, "shared");
+        let current_root = absolute_workspace_root(&workspace);
+        let foreign_root = "/data/work/oldjob/hostexecutor";
+        let foreign_path = format!("{foreign_root}/libs/shared/src/main.gleam");
+        let mut artefact = Vec::new();
+        artefact.extend_from_slice(&(foreign_path.len() as u64).to_le_bytes());
+        artefact.extend_from_slice(foreign_path.as_bytes());
+        test_workspace.write_file(
+            "libs/shared/build/dev/erlang/shared/_gleam_artefacts/shared.cache",
+            "",
+        );
+        fs::write(
+            shared
+                .root
+                .join("build/dev/erlang/shared/_gleam_artefacts/shared.cache"),
+            &artefact,
+        )
+        .expect("artefact should write");
+
+        let task_hash = compute_task_hash_with_gleam_version(
+            &workspace,
+            &graph,
+            shared,
+            Target::Build,
+            GLEAM_VERSION,
+        )
+        .expect("build hash should compute");
+        store_successful_build(
+            &workspace,
+            shared,
+            &task_hash,
+            &TaskExecution::success("built\n", ""),
+        )
+        .expect("build should cache");
+
+        let entry_dir = task_cache_entry_dir(&workspace, &task_hash);
+        let mut metadata =
+            read_cache_entry_metadata(&entry_dir.join("meta.json")).expect("metadata should load");
+        metadata.workspace_root = foreign_root.to_string();
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&metadata).expect("metadata should serialize"),
+        )
+        .expect("metadata should rewrite");
+
+        fs::remove_dir_all(shared.root.join("build")).expect("build should clear");
+        restore_successful_build(&workspace, shared, &task_hash)
+            .expect("restore should succeed")
+            .expect("cache should hit");
+
+        let restored = fs::read(
+            shared
+                .root
+                .join("build/dev/erlang/shared/_gleam_artefacts/shared.cache"),
+        )
+        .expect("restored artefact should exist");
+        let expected_path = format!("{current_root}/libs/shared/src/main.gleam");
+        assert!(
+            restored
+                .windows(expected_path.len())
+                .any(|window| window == expected_path.as_bytes()),
+            "expected relocated path {expected_path}"
+        );
+        assert!(find_bytes(&restored, foreign_root.as_bytes()).is_none());
     }
 
     #[test]

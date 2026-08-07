@@ -304,6 +304,10 @@ cached. Every configured cached folder must be created by a successful build.
 Cache restore completely replaces each folder so stale output files cannot
 survive a cache hit. Cached folders must be non-overlapping, project-relative
 directories without `.` or `..`, and symlinks are not supported within them.
+Gleam embeds absolute source paths in `build/` artefacts, so build cache
+entries record the producing workspace root and rewrite those paths on restore
+when the checkout lives at a different absolute location (for example unique
+CI workdirs).
 
 Useful cache controls:
 
