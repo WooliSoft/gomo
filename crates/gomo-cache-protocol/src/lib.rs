@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: &str = "v1";
-pub const CACHE_SCHEMA_VERSION: &str = "v6";
+pub const CACHE_SCHEMA_VERSION: &str = "v7";
 pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.gomo.cache.v1+zstd";
 
 pub const HEADER_PROTOCOL_VERSION: &str = "x-gomo-protocol-version";

@@ -620,3 +620,39 @@ fn is_bundle_validation_failure(error: &anyhow::Error) -> bool {
         && !message.contains("failed to rename")
         && !message.contains("no space")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn gomo_and_cache_server_package_versions_match() {
+        let gomo_version = env!("CARGO_PKG_VERSION");
+        let server_manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/gomo-cache-server/Cargo.toml");
+        let server_toml = fs::read_to_string(&server_manifest_path).unwrap_or_else(|error| {
+            panic!("failed to read {}: {error}", server_manifest_path.display())
+        });
+        let server_manifest: toml::Value = toml::from_str(&server_toml).unwrap_or_else(|error| {
+            panic!(
+                "failed to parse {}: {error}",
+                server_manifest_path.display()
+            )
+        });
+        let server_version = server_manifest
+            .get("package")
+            .and_then(|package| package.get("version"))
+            .and_then(|version| version.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing package.version in {}",
+                    server_manifest_path.display()
+                )
+            });
+        assert_eq!(
+            gomo_version, server_version,
+            "gomo and gomo-cache-server must share one release version"
+        );
+    }
+}

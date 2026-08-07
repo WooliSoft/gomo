@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build and release Linux x86_64 binary
+    name: Build and release Linux x86_64 binaries
     runs-on: ubuntu-latest
 
     steps:
@@ -24,19 +24,31 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: Build binary
-        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
+            --package gomo \
+            --package gomo-cache-server
 
-      - name: Package binary
+      - name: Package binaries
         run: |
           set -euo pipefail
 
-          archive="gomo-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
-          strip target/x86_64-unknown-linux-gnu/release/gomo
+          target_dir="target/x86_64-unknown-linux-gnu/release"
           mkdir -p dist
-          tar -C target/x86_64-unknown-linux-gnu/release -czf "dist/$archive" gomo
-          checksum="$(sha256sum "dist/$archive")"
-          printf '%s  %s\n' "${checksum%% *}" "$archive" > "dist/$archive.sha256"
+
+          package_binary() {
+            local binary="$1"
+            local archive="${binary}-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+            strip "$target_dir/$binary"
+            tar -C "$target_dir" -czf "dist/$archive" "$binary"
+            checksum="$(sha256sum "dist/$archive")"
+            printf '%s  %s\n' "${checksum%% *}" "$archive" > "dist/$archive.sha256"
+          }
+
+          package_binary gomo
+          package_binary gomo-cache-server
 
       - name: Upload release assets
         env:

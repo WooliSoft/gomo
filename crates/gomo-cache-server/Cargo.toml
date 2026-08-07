@@ -1,6 +1,6 @@
 [package]
 name = "gomo-cache-server"
-version = "1.8.0"
+version = "1.8.2"
 edition = "2024"
 description = "Authenticated immutable HTTP cache service for Gomo"
 

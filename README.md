@@ -374,7 +374,13 @@ HTTPS uses the platform certificate store. Install an internal cache service's
 root CA in the operating system trust store instead of disabling certificate
 validation.
 
-The server is a separate binary:
+The server is a separate binary. Linux x86_64 GitHub releases publish both
+`gomo` and `gomo-cache-server` archives:
+
+```text
+gomo-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+gomo-cache-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+```
 
 ```sh
 gomo-cache-server migrate

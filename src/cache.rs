@@ -16,7 +16,7 @@ use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, Target, TaskExecution};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) const CACHE_SCHEMA_VERSION: &str = "v7";
+pub(crate) const CACHE_SCHEMA_VERSION: &str = gomo_cache_protocol::CACHE_SCHEMA_VERSION;
 
 const CACHE_STORE_LOCK_ATTEMPTS: usize = 300;
 const CACHE_STORE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
