@@ -1278,6 +1278,7 @@ fn named_task_input_files(
         return Ok(Vec::new());
     }
 
+    let mut resolved_patterns = Vec::with_capacity(patterns.len());
     let mut builder = GlobSetBuilder::new();
     for input in patterns {
         let pattern = workspace_relative_pattern(workspace, project, input.glob())?;
@@ -1286,11 +1287,34 @@ fn named_task_input_files(
                 format!("invalid input glob `{pattern}` for task `{}`", task.name)
             })?,
         );
+        resolved_patterns.push(pattern);
     }
     let globs = builder.build()?;
-    let walk_root = project
-        .map(|project| project.root.as_path())
-        .unwrap_or(workspace.root.as_path());
+    // Project tasks may declare `{workspace_root}/...` inputs outside the package
+    // tree. Walk the whole workspace when any resolved pattern leaves the project
+    // root; otherwise stay inside the project for cheaper hashing.
+    let walk_root = {
+        let project_prefix = project.map(|project| {
+            project
+                .root_relative_path
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        let needs_workspace_walk = project_prefix.as_ref().is_none_or(|prefix| {
+            resolved_patterns.iter().any(|pattern| {
+                pattern != prefix
+                    && !pattern.starts_with(&format!("{prefix}/"))
+                    && !pattern.starts_with(&format!("{prefix}\\"))
+            })
+        });
+        if needs_workspace_walk {
+            workspace.root.as_path()
+        } else {
+            project
+                .map(|project| project.root.as_path())
+                .unwrap_or(workspace.root.as_path())
+        }
+    };
     let mut files = WalkDir::new(walk_root)
         .into_iter()
         .filter_entry(|entry| {
@@ -1299,7 +1323,16 @@ fn named_task_input_files(
             entry.depth() == 0
                 || !matches!(
                     entry.file_name().to_str(),
-                    Some(".git" | ".jj" | ".gomo" | "build" | "target" | "node_modules")
+                    Some(
+                        ".git"
+                            | ".jj"
+                            | ".gomo"
+                            | ".devenv"
+                            | "build"
+                            | "target"
+                            | "node_modules"
+                            | "vendor"
+                    )
                 )
                 || entry.depth() > 1
         })
@@ -1934,6 +1967,87 @@ steps = [{ exec = { program = "server" } }]
         .expect_err("persistent JSON should fail before execution");
 
         assert!(error.to_string().contains("--json is not supported"));
+    }
+
+    #[test]
+    fn project_task_inputs_can_include_workspace_rooted_paths() {
+        let workspace = TestWorkspace::new("gomo-project-workspace-inputs");
+        workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.bundle]
+scope = "project"
+cache = true
+inputs = [
+  "src/**",
+  "{workspace_root}/tooling/shared.txt",
+]
+outputs = ["out.txt"]
+steps = [{ shell = { command = "cat src/app.txt \"$GOMO_WORKSPACE_ROOT/tooling/shared.txt\" > out.txt" } }]
+"#,
+        );
+        workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.tasks.bundle]
+extends = "bundle"
+"#,
+        );
+        workspace.write_file("apps/demo/src/app.txt", "app\n");
+        workspace.write_file("tooling/shared.txt", "shared\n");
+
+        run(
+            workspace.path(),
+            TaskRunRequest {
+                name: "bundle".to_string(),
+                project: Some("demo".to_string()),
+                parallelism: Parallelism::Fixed(1),
+            },
+            CacheOptions {
+                no_cache: false,
+                no_restore: false,
+                ..CacheOptions::default()
+            },
+            OutputOptions::default(),
+        )
+        .expect("project task should hash workspace-rooted inputs");
+
+        let discovered =
+            workspace::discover_from(workspace.path()).expect("workspace should discover");
+        let task = discovered
+            .projects
+            .iter()
+            .find(|project| project.name == "demo")
+            .expect("demo project")
+            .gomo_tasks
+            .get("bundle")
+            .expect("bundle task");
+        let inputs =
+            named_task_input_files(&discovered, task, Some("demo")).expect("inputs should resolve");
+        let relative = inputs
+            .iter()
+            .map(|path| {
+                path.strip_prefix(workspace.path())
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(relative.iter().any(|path| path == "apps/demo/src/app.txt"));
+        assert!(relative.iter().any(|path| path == "tooling/shared.txt"));
+
+        let missing = named_task_missing_inputs(&discovered, task, Some("demo"), &relative)
+            .expect("missing inputs should resolve");
+        assert!(
+            missing.is_empty(),
+            "workspace-rooted inputs should match: {missing:?}"
+        );
     }
 
     #[test]
