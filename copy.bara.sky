@@ -1,12 +1,12 @@
 PUBLIC_REPO_URL = "https://github.com/WooliSoft/gomo.git"
-PRIVATE_REPO_SSH_URL = "git@github.com:WooliSoft/wooli.git"
+PRIVATE_REPO_SSH_URL = "ssh://git@git.cowcloud.cc:222/Wooli/wooli.git"
 
 BOT_AUTHOR = "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
 
 
 def _skip_synced_from_private(ctx):
     if ctx.find_label("Gomo-Private-RevId"):
-        core.fail_with_noop("Skipping commit that originated from WooliSoft/wooli.")
+        core.fail_with_noop("Skipping commit that originated from Wooli/wooli.")
 
 
 def gomo_public_to_private_workflow(name, branch):
@@ -26,6 +26,7 @@ def gomo_public_to_private_workflow(name, branch):
             exclude = [
                 ".github/**",
                 "copy.bara.sky",
+                "infra/ci/forgejo-known-hosts",
                 "target/**",
             ],
         ),
@@ -34,6 +35,7 @@ def gomo_public_to_private_workflow(name, branch):
             exclude = [
                 "tools/gomo/.github/**",
                 "tools/gomo/copy.bara.sky",
+                "tools/gomo/infra/ci/forgejo-known-hosts",
                 "tools/gomo/target/**",
             ],
         ),
