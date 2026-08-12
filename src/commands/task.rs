@@ -481,6 +481,17 @@ fn select_task<'a>(
     }
 }
 
+fn nested_step_output_options(task: &Task, output_options: OutputOptions) -> OutputOptions {
+    if task.persistent {
+        OutputOptions {
+            tui: false,
+            ..output_options
+        }
+    } else {
+        output_options
+    }
+}
+
 fn execute_task(
     workspace: &Workspace,
     task: &Task,
@@ -598,6 +609,11 @@ fn execute_task(
         None
     };
 
+    // Persistent steps own the terminal for long-lived child processes
+    // (`Stdio::inherit`). Nested finite runs must not open the ratatui build TUI
+    // or they fight siblings (and the still-running process on rebuild) for the
+    // same stdout — producing wrapped/garbled frames under parallel aggregates.
+    let step_output_options = nested_step_output_options(task, output_options);
     match task.mode {
         TaskMode::Sequential => {
             for step in &task.steps {
@@ -608,7 +624,7 @@ fn execute_task(
                     project_name,
                     parallelism,
                     cache_options,
-                    output_options,
+                    step_output_options,
                     state,
                 )?);
             }
@@ -625,7 +641,7 @@ fn execute_task(
                             project_name,
                             parallelism,
                             cache_options,
-                            output_options,
+                            step_output_options,
                             state,
                         )
                     }));
@@ -1967,6 +1983,44 @@ steps = [{ exec = { program = "server" } }]
         .expect_err("persistent JSON should fail before execution");
 
         assert!(error.to_string().contains("--json is not supported"));
+    }
+
+    #[test]
+    fn nested_step_output_options_disables_tui_for_persistent_tasks() {
+        let interactive = OutputOptions {
+            tui: true,
+            ci: false,
+            json: false,
+            terminal_width: Some(120),
+        };
+        let finite = Task {
+            name: "build".to_string(),
+            scope: TaskScope::Workspace,
+            description: None,
+            depends_on: Vec::new(),
+            dependency_cache_strategies: Default::default(),
+            mode: TaskMode::Sequential,
+            steps: Vec::new(),
+            persistent: false,
+            cache: false,
+            remote_cache: true,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            env_inputs: Vec::new(),
+            tools: Vec::new(),
+        };
+        let persistent = Task {
+            persistent: true,
+            name: "serve".to_string(),
+            ..finite.clone()
+        };
+
+        assert!(nested_step_output_options(&finite, interactive).tui);
+        assert!(!nested_step_output_options(&persistent, interactive).tui);
+        assert_eq!(
+            nested_step_output_options(&persistent, interactive).terminal_width,
+            Some(120)
+        );
     }
 
     #[test]
