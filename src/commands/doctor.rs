@@ -570,6 +570,7 @@ version = "0.1.0"
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("doctor should render plain CI output");
@@ -601,6 +602,7 @@ version = "0.1.0"
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("doctor JSON should render");

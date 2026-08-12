@@ -16,6 +16,7 @@ use crate::commands::{CommandOutput, OutputOptions};
 use crate::gleam_toml::GomoReloadStrategy;
 use crate::graph::ProjectGraph;
 use crate::runner::{CommandOptions, GleamCommandRunner, Target};
+use crate::ui::surface::{self, RenderSurface};
 use crate::workspace::{self, Project, Workspace};
 
 use super::run::{self, CacheOptions, Parallelism, ProjectSelection, RunRequest};
@@ -52,20 +53,42 @@ pub(crate) fn run(
     let workspace = workspace::discover_from(cwd)?;
     let graph = ProjectGraph::build(&workspace)?;
     let project = find_project(&workspace, &request.project)?.clone();
-    build_project(
+    let build_cancellation = output_options
+        .surface
+        .as_ref()
+        .map(RenderSurface::cancellation)
+        .unwrap_or_default();
+    let build_result = build_project(
         &workspace,
         &graph,
         &project,
         cache_options,
         request.parallelism,
-        output_options,
-        CancellationToken::new(),
-    )?;
+        output_options.clone(),
+        build_cancellation.clone(),
+    );
+    if build_cancellation.is_cancelled() {
+        return Ok(CommandOutput::success(String::new()));
+    }
+    build_result?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to initialize the async runtime for gomo dev")?;
+    if output_options.surface.is_some() {
+        let result = runtime.block_on(run_async_surface(
+            cwd.to_path_buf(),
+            request,
+            cache_options,
+            output_options,
+            workspace,
+            graph,
+            project,
+        ));
+        runtime.shutdown_background();
+        return result;
+    }
     runtime.block_on(run_async(
         cwd.to_path_buf(),
         request,
@@ -156,7 +179,7 @@ async fn run_async(
                     &mut graph,
                     &mut project,
                     &batch,
-                    output_options,
+                    output_options.clone(),
                     &cancellation,
                 ).await? {
                     DevBatchAction::None => {}
@@ -392,6 +415,7 @@ fn build_project(
     };
     let project_names = run::selected_project_names(workspace, graph, &request)?;
     let build_cancellation = cancellation.clone();
+    let surface = output_options.surface.clone();
     let output = run::run_project_names_with_cancellation(
         workspace,
         graph,
@@ -401,14 +425,14 @@ fn build_project(
         &GleamCommandRunner,
         cache_options,
         parallelism,
-        output_options,
+        output_options.without_tui(),
         cancellation,
     )?;
     if build_cancellation.is_cancelled() {
         bail!("build cancelled");
     }
     if !output.stdout.is_empty() {
-        report(&output.stdout);
+        report_to(&output.stdout, surface.as_ref());
     }
     if output.exit_code != 0 {
         bail!("build exited with code {}", output.exit_code);
@@ -431,6 +455,202 @@ fn is_quit_event(event: &Event) -> bool {
 fn report(message: &str) {
     print!("{message}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn report_to(message: &str, surface: Option<&RenderSurface>) {
+    if let Some(surface) = surface {
+        surface.append_log(message);
+    } else {
+        report(message);
+    }
+}
+
+/// Dev under a parent persistent TUI: pipe the process and never open nested UI.
+async fn run_async_surface(
+    cwd: PathBuf,
+    request: DevRequest,
+    cache_options: CacheOptions,
+    output_options: OutputOptions,
+    mut workspace: Workspace,
+    mut graph: ProjectGraph,
+    mut project: Project,
+) -> Result<CommandOutput> {
+    let surface = output_options
+        .surface
+        .clone()
+        .context("surface dev path requires a render surface")?;
+    let session_cancel = surface.cancellation();
+
+    let mut process_cancel = CancellationToken::new();
+    let (mut process_handle, mut process_result) =
+        spawn_surface_dev_process(&project, &request, &surface, &process_cancel);
+
+    let action_cancellation = session_cancel.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let wx = Watchexec::new(move |mut action| {
+        let stopped = action.signals().any(|signal| {
+            matches!(
+                signal,
+                Signal::Interrupt | Signal::Terminate | Signal::ForceStop
+            )
+        }) || action.events.iter().any(is_quit_event);
+        if stopped {
+            action_cancellation.cancel();
+        }
+        let _ = sender.send(DevBatch {
+            events: action.events.iter().cloned().collect(),
+            stopped,
+        });
+        if stopped {
+            action.quit();
+        }
+        action
+    })
+    .map_err(|error| anyhow!("failed to initialize Watchexec: {error}"))?;
+    wx.config.pathset([workspace.root.clone()]);
+    wx.config.throttle(request.debounce);
+    // The parent persistent-task terminal owns keyboard input.
+    wx.config.keyboard_events(false);
+    let mut watcher_task = wx.main();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = &mut process_result => {
+                watcher_task.abort();
+                let join_result = process_handle.join();
+                return surface_dev_exit(result, join_result);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(40)) => {
+                if session_cancel.is_cancelled() {
+                    process_cancel.cancel();
+                    let _ = process_handle.join();
+                    watcher_task.abort();
+                    return Ok(CommandOutput::success(String::new()));
+                }
+            }
+            watcher_result = &mut watcher_task => {
+                process_cancel.cancel();
+                let _ = process_handle.join();
+                let watcher_result = watcher_result.context("Watchexec task failed")?;
+                watcher_result.map_err(|error| anyhow!("Watchexec failed: {error}"))?;
+                return Ok(CommandOutput::success(String::new()));
+            }
+            batch = receiver.recv() => {
+                let Some(batch) = batch else {
+                    process_cancel.cancel();
+                    let _ = process_handle.join();
+                    watcher_task.abort();
+                    bail!("Watchexec event channel stopped unexpectedly");
+                };
+                if batch.stopped || session_cancel.is_cancelled() {
+                    process_cancel.cancel();
+                    let _ = process_handle.join();
+                    watcher_task.abort();
+                    return Ok(CommandOutput::success(String::new()));
+                }
+                match handle_batch(
+                    &cwd,
+                    &request,
+                    &cache_options,
+                    &mut workspace,
+                    &mut graph,
+                    &mut project,
+                    &batch,
+                    output_options.clone(),
+                    &session_cancel,
+                ).await? {
+                    DevBatchAction::None => {}
+                    DevBatchAction::Restart | DevBatchAction::Recreate(_) => {
+                        report_to("gomo dev: restarting development process\n", Some(&surface));
+                        process_cancel.cancel();
+                        let _ = process_handle.join();
+                        if session_cancel.is_cancelled() {
+                            watcher_task.abort();
+                            return Ok(CommandOutput::success(String::new()));
+                        }
+                        process_cancel = CancellationToken::new();
+                        (process_handle, process_result) = spawn_surface_dev_process(
+                            &project,
+                            &request,
+                            &surface,
+                            &process_cancel,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_surface_dev_process(
+    project: &Project,
+    request: &DevRequest,
+    surface: &RenderSurface,
+    process_cancel: &CancellationToken,
+) -> (
+    std::thread::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+) {
+    let project = project.clone();
+    let request = request.clone();
+    let linked = link_cancellation(surface.cancellation(), process_cancel.clone());
+    let surface = surface.with_cancellation(linked);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let handle = std::thread::spawn(move || {
+        let (program, args) = if !request.command.is_empty() {
+            (request.command[0].clone(), request.command[1..].to_vec())
+        } else if let Some(command) = project.gomo_dev.command.as_deref() {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), command.to_string()],
+            )
+        } else {
+            ("gleam".to_string(), vec!["run".to_string()])
+        };
+        let mut command = std::process::Command::new(&program);
+        command.args(&args).current_dir(&project.root);
+        let result = match surface::run_piped_persistent(command, &surface, || {
+            "development process exited".to_string()
+        }) {
+            Ok(_) => Ok(()),
+            Err(_error) if surface.cancellation().is_cancelled() => Ok(()),
+            Err(error) if error.to_string().contains("development process exited") => {
+                // Unexpected exit — treat as failure so the parent step stops siblings.
+                Err(error)
+            }
+            Err(error) => Err(error),
+        };
+        let _ = result_tx.send(result);
+    });
+    (handle, result_rx)
+}
+
+fn surface_dev_exit(
+    result: std::result::Result<Result<()>, tokio::sync::oneshot::error::RecvError>,
+    join_result: std::thread::Result<()>,
+) -> Result<CommandOutput> {
+    if join_result.is_err() {
+        bail!("development process worker panicked");
+    }
+    match result {
+        Ok(Ok(())) => bail!("development process exited"),
+        Ok(Err(error)) => Err(error),
+        Err(_) => bail!("development process result channel stopped unexpectedly"),
+    }
+}
+
+fn link_cancellation(left: CancellationToken, right: CancellationToken) -> CancellationToken {
+    let linked = CancellationToken::new();
+    let signal = linked.clone();
+    std::thread::spawn(move || {
+        while !left.is_cancelled() && !right.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        signal.cancel();
+    });
+    linked
 }
 
 #[cfg(test)]
@@ -526,5 +746,60 @@ command = "sleep 10"
 
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn completed_surface_dev_process_is_an_error() {
+        let error = surface_dev_exit(Ok(Ok(())), Ok(()))
+            .expect_err("an unexpected development process exit should fail");
+
+        assert_eq!(error.to_string(), "development process exited");
+    }
+
+    #[test]
+    fn surface_dev_process_error_is_preserved() {
+        let error = surface_dev_exit(Ok(Err(anyhow!("address already in use"))), Ok(()))
+            .expect_err("a development process error should fail");
+
+        assert_eq!(error.to_string(), "address already in use");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_dev_returns_when_process_exits() {
+        let test_workspace = TestWorkspace::new("gomo-surface-dev-exit");
+        test_workspace.write_gomo_config();
+        test_workspace.write_manifest(
+            "apps/demo",
+            r#"
+name = "demo"
+version = "0.1.0"
+
+[tools.gomo.build]
+command = "true"
+"#,
+        );
+        let cancellation = CancellationToken::new();
+        let (event_tx, _event_rx, _) = RenderSurface::channel(cancellation.clone(), false);
+        let surface = RenderSurface::new("demo:dev", event_tx, cancellation, false);
+
+        let error = run(
+            test_workspace.path(),
+            DevRequest {
+                project: "demo".to_string(),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+                debounce: Duration::from_millis(10),
+                reload: None,
+                parallelism: Parallelism::Fixed(1),
+            },
+            CacheOptions::disabled(),
+            OutputOptions {
+                surface: Some(surface),
+                ..OutputOptions::default()
+            },
+        )
+        .expect_err("an exited development process should fail");
+
+        assert!(error.to_string().contains("failed with exit code 7"));
     }
 }

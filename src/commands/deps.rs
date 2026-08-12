@@ -539,6 +539,7 @@ packages = [
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("deps check should render plain CI output");
@@ -577,6 +578,7 @@ packages = [
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("deps check JSON should render");
@@ -630,6 +632,7 @@ packages = [
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("deps check JSON should render");

@@ -242,96 +242,6 @@ fn run_with_runner_and_cache(
     let graph = ProjectGraph::build(&workspace)?;
     let project_names = selected_project_names(&workspace, &graph, &request)?;
 
-    let has_bound_tasks = project_names.iter().any(|name| {
-        workspace
-            .projects
-            .iter()
-            .find(|project| project.name == *name)
-            .and_then(|project| project.gomo_targets.get(request.target.as_str()))
-            .and_then(|config| config.task.as_ref())
-            .is_some()
-    });
-    if has_bound_tasks && matches!(request.target, Target::Build | Target::Test) {
-        crate::dependency_vendor::prepare_projects(&workspace, &project_names)?;
-    }
-
-    if has_bound_tasks {
-        let mut output = String::new();
-        let mut native_projects = Vec::new();
-        let flush_native = |projects: &mut Vec<String>, output: &mut String| -> Result<()> {
-            if projects.is_empty() {
-                return Ok(());
-            }
-            output.push_str(
-                &run_project_names_with_optional_control(
-                    &workspace,
-                    &graph,
-                    projects,
-                    request.target,
-                    request.command_options,
-                    runner,
-                    cache_options,
-                    request.parallelism,
-                    output_options,
-                    CancellationToken::new(),
-                    None,
-                    false,
-                )?
-                .stdout,
-            );
-            projects.clear();
-            Ok(())
-        };
-
-        for project_name in &project_names {
-            let project = workspace
-                .projects
-                .iter()
-                .find(|project| project.name == *project_name)
-                .with_context(|| format!("unknown project `{project_name}`"))?;
-            if let Some(task_name) = project
-                .gomo_targets
-                .get(request.target.as_str())
-                .and_then(|config| config.task.as_ref())
-            {
-                flush_native(&mut native_projects, &mut output)?;
-                let target_key = (project_name.clone(), request.target.as_str().to_string());
-                if super::task::target_task_stack_contains(&target_key) {
-                    bail!(
-                        "target `{}` on project `{project_name}` is bound to task `{task_name}`, which re-enters the same target",
-                        request.target.as_str()
-                    );
-                }
-                super::task::push_target_task_stack(target_key.clone());
-                let task_result = super::task::run(
-                    cwd,
-                    super::task::TaskRunRequest {
-                        name: task_name.clone(),
-                        project: Some(project_name.clone()),
-                        parallelism: request.parallelism,
-                    },
-                    cache_options,
-                    output_options,
-                );
-                super::task::pop_target_task_stack();
-                output.push_str(
-                    &task_result
-                        .with_context(|| {
-                            format!(
-                                "task `{task_name}` bound to target `{}` on project `{project_name}` failed",
-                                request.target.as_str()
-                            )
-                        })?
-                        .stdout,
-                );
-            } else {
-                native_projects.push(project_name.clone());
-            }
-        }
-        flush_native(&mut native_projects, &mut output)?;
-        return Ok(CommandOutput::success(output));
-    }
-
     run_project_names(
         &workspace,
         &graph,
@@ -628,8 +538,18 @@ where
     let mut first_error = None;
     let mut stop_scheduling = false;
     let max_parallel = parallelism.resolve(workspace.default_parallelism);
-    let tui_enabled =
-        output_options.tui && !output_options.ci && !output_options.json && target.supports_tui();
+    let tui_enabled = output_options.tui
+        && !output_options.ci
+        && !output_options.json
+        && output_options.surface.is_none()
+        && target.supports_tui();
+    let surface = output_options.surface.clone();
+    let nested_output_options = OutputOptions {
+        json: false,
+        tui: false,
+        ..output_options.clone()
+    };
+    let target_task_stack = super::task::target_task_stack();
     let task_commands =
         task_command_displays(project_names, project_index, target, command_options)?;
     if let Some(control) = control.as_ref() {
@@ -671,6 +591,9 @@ where
                 let progress_project = project_name.clone();
                 let progress_sender = sender.clone();
                 let task_cancellation = &cancellation;
+                let step_surface = surface.clone();
+                let nested_output_options = nested_output_options.clone();
+                let target_task_stack = target_task_stack.clone();
 
                 if let Some(terminal) = terminal.as_mut()
                     && let Err(error) = terminal.task_started(&started_project)
@@ -682,34 +605,41 @@ where
                     break;
                 }
                 scope.spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut report_output = |chunk: &str| {
-                            if tui_enabled {
-                                let _ = progress_sender.send(TaskRunnerMessage::Output {
-                                    project: progress_project.clone(),
-                                    chunk: chunk.to_string(),
-                                });
-                            }
-                        };
-                        execute_single_task(
-                            workspace,
-                            graph,
-                            project,
-                            target,
-                            command_options,
-                            runner,
-                            cache_options,
-                            compute_task_hash,
-                            &command_display,
-                            &mut report_output,
-                            task_cancellation,
-                        )
-                    }))
-                    .unwrap_or_else(|payload| {
-                        Err(anyhow::anyhow!(
-                            "task worker panicked: {}",
-                            panic_payload_message(payload.as_ref())
-                        ))
+                    let result = super::task::with_target_task_stack(target_task_stack, || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut report_output = |chunk: &str| {
+                                if tui_enabled {
+                                    let _ = progress_sender.send(TaskRunnerMessage::Output {
+                                        project: progress_project.clone(),
+                                        chunk: chunk.to_string(),
+                                    });
+                                }
+                                if let Some(surface) = step_surface.as_ref() {
+                                    surface.append_log(chunk);
+                                }
+                            };
+                            execute_single_task(
+                                workspace,
+                                graph,
+                                project,
+                                target,
+                                command_options,
+                                runner,
+                                cache_options,
+                                parallelism,
+                                nested_output_options,
+                                compute_task_hash,
+                                &command_display,
+                                &mut report_output,
+                                task_cancellation,
+                            )
+                        }))
+                        .unwrap_or_else(|payload| {
+                            Err(anyhow::anyhow!(
+                                "task worker panicked: {}",
+                                panic_payload_message(payload.as_ref())
+                            ))
+                        })
                     });
                     let _ = sender.send(TaskRunnerMessage::Completed(TaskRunResult {
                         project: project_name,
@@ -937,10 +867,28 @@ fn task_command_displays(
                 .with_context(|| format!("unknown project `{project_name}`"))?;
             Ok((
                 project_name.clone(),
-                command_options.command_display(project, target)?,
+                task_command_display(project, target, command_options)?,
             ))
         })
         .collect()
+}
+
+fn task_command_display(
+    project: &Project,
+    target: Target,
+    command_options: CommandOptions,
+) -> Result<String> {
+    if let Some(task_name) = bound_task_name(project, target) {
+        return Ok(format!(
+            "gomo task run {task_name} --project {}",
+            project.name
+        ));
+    }
+    command_options.command_display(project, target)
+}
+
+fn bound_task_name(project: &Project, target: Target) -> Option<&str> {
+    project.gomo_targets.get(target.as_str())?.task.as_deref()
 }
 
 fn build_task_graph(
@@ -1006,8 +954,7 @@ fn uses_custom_build_command(project_index: &BTreeMap<&str, &Project>, project: 
     project_index
         .get(project)
         .and_then(|project| project.gomo_targets.get(Target::Build.as_str()))
-        .and_then(|config| config.command.as_ref())
-        .is_some()
+        .is_some_and(|config| config.command.is_some() || config.task.is_some())
 }
 
 fn pop_ready_task(ready: &mut Vec<String>) -> Option<String> {
@@ -1036,6 +983,8 @@ fn execute_single_task<R, H>(
     command_options: CommandOptions,
     runner: &R,
     cache_options: CacheOptions,
+    parallelism: Parallelism,
+    nested_output_options: OutputOptions,
     compute_task_hash: &H,
     command_display: &str,
     output_progress: &mut dyn FnMut(&str),
@@ -1059,6 +1008,54 @@ where
         project.root_relative_path.display()
     ));
     output.push_str(&format!("$ {command_display}\n"));
+
+    if let Some(task_name) = bound_task_name(project, target) {
+        let target_key = (project.name.clone(), target.as_str().to_string());
+        if super::task::target_task_stack_contains(&target_key) {
+            bail!(
+                "target `{target}` on project `{}` is bound to task `{task_name}`, which re-enters the same target",
+                project.name
+            );
+        }
+        let task_result = super::task::with_pushed_target_task(target_key, || {
+            super::task::run(
+                &workspace.root,
+                super::task::TaskRunRequest {
+                    name: task_name.to_string(),
+                    project: Some(project.name.clone()),
+                    parallelism,
+                },
+                cache_options,
+                nested_output_options,
+            )
+        });
+        let task_output = task_result.with_context(|| {
+            format!(
+                "task `{task_name}` bound to target `{target}` on project `{}` failed",
+                project.name
+            )
+        })?;
+        output_progress(&task_output.stdout);
+        append_stream(&mut output, &task_output.stdout);
+        output.push('\n');
+        return Ok(CompletedTask {
+            output,
+            outcome: TaskOutcome {
+                project: project.name.clone(),
+                status: if task_output.is_success() {
+                    TaskStatus::Succeeded
+                } else {
+                    TaskStatus::Failed(task_output.exit_code)
+                },
+                cache_status: None,
+                cache_source: None,
+                remote_scope: None,
+                bytes_downloaded: 0,
+                bytes_uploaded: 0,
+                upload_result: None,
+            },
+        });
+    }
 
     let task_hash = if cache_options.should_use_cache(target, command_options) {
         let task_hash = compute_task_hash(workspace, graph, project, target)?;
@@ -1846,6 +1843,74 @@ version = "0.1.0"
     }
 
     #[test]
+    fn task_bound_targets_share_one_scheduler_summary() {
+        let test_workspace = TestWorkspace::new("gomo-run-bound-task");
+        test_workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.bound-build]
+scope = "project"
+steps = [{ shell = { command = "printf 'bound passed\\n'" } }]
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/alpha",
+            r#"
+name = "alpha"
+version = "0.1.0"
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/beta",
+            r#"
+name = "beta"
+version = "0.1.0"
+
+[tools.gomo.tasks.bound-build]
+extends = "bound-build"
+
+[tools.gomo.build]
+task = "bound-build"
+"#,
+        );
+        test_workspace.write_manifest(
+            "apps/gamma",
+            r#"
+name = "gamma"
+version = "0.1.0"
+"#,
+        );
+        let runner = FakeRunner::default();
+
+        let output = run_with_runner(
+            test_workspace.path(),
+            RunRequest {
+                target: Target::Build,
+                command_options: CommandOptions::default(),
+                selection: ProjectSelection::All,
+                with_deps: false,
+                parallelism: Parallelism::Fixed(1),
+            },
+            &runner,
+        )
+        .expect("mixed native and task-bound targets should run");
+
+        assert_eq!(runner.calls(), ["alpha:build", "gamma:build"]);
+        assert_eq!(output.stdout.matches("Task Summary").count(), 1);
+        assert!(output.stdout.contains("Total: 3"));
+        assert!(output.stdout.contains("bound passed"));
+        assert!(
+            output
+                .stdout
+                .contains("$ gomo task run bound-build --project beta")
+        );
+        assert!(output.stdout.contains("[ok] beta:build"));
+    }
+
+    #[test]
     fn run_all_schedules_path_dependencies_outside_project_roots() {
         let test_workspace = TestWorkspace::new("gomo-run-test");
         test_workspace.write_file(
@@ -1914,6 +1979,7 @@ version = "0.1.0"
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("JSON run should succeed");

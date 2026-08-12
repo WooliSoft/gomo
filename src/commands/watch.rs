@@ -34,6 +34,7 @@ use super::run::{self, CacheOptions, Parallelism, ProjectSelection, RunRequest};
 use super::watch_support::normalize_paths;
 
 const WATCH_SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const WATCH_SPINNER_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatchRequest {
@@ -191,7 +192,7 @@ async fn animate_watcher_startup(
     parallelism: usize,
     alternate_screen_enabled: Arc<AtomicBool>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = tokio::time::interval(WATCH_SPINNER_INTERVAL);
     let mut spinner_frame = 0;
     loop {
         tokio::select! {
@@ -380,7 +381,7 @@ fn run_loop(
             cache_options,
             request.with_deps,
             request.parallelism,
-            output_options,
+            output_options.clone(),
             tui_control.clone(),
         )?;
     }
@@ -414,7 +415,7 @@ fn run_loop(
                         Err(error) => {
                             report_watch_error(
                                 &tui_control,
-                                output_options,
+                                output_options.clone(),
                                 format!("callback configuration failed: {error}"),
                             )?;
                             continue;
@@ -436,14 +437,14 @@ fn run_loop(
                         cache_options,
                         request.with_deps,
                         request.parallelism,
-                        output_options,
+                        output_options.clone(),
                         tui_control.clone(),
                     )?;
                 }
                 Err(error) => {
                     report_watch_error(
                         &tui_control,
-                        output_options,
+                        output_options.clone(),
                         format!("graph refresh failed: {error}"),
                     )?;
                 }
@@ -472,7 +473,7 @@ fn run_loop(
             cache_options,
             request.with_deps,
             request.parallelism,
-            output_options,
+            output_options.clone(),
             tui_control.clone(),
         )?;
     }
@@ -681,7 +682,7 @@ fn run_cycle(
         &crate::runner::GleamCommandRunner,
         cache_options,
         parallelism,
-        output_options,
+        output_options.clone(),
         tui_control,
     )?;
     if !output.stdout.is_empty() && !output_options.tui {

@@ -377,6 +377,7 @@ fn execute_from_with_terminal(
         } else {
             None
         },
+        surface: None,
     };
 
     match cli.command {

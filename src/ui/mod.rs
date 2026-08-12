@@ -3,6 +3,7 @@ use std::env;
 pub(crate) mod graph;
 pub(crate) mod projects;
 pub(crate) mod run;
+pub(crate) mod surface;
 mod terminal;
 
 pub(crate) fn is_agent_environment() -> bool {

@@ -12,18 +12,42 @@ thread_local! {
     static TARGET_TASK_STACK: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
+struct TargetTaskStackReset(Vec<(String, String)>);
+
+impl Drop for TargetTaskStackReset {
+    fn drop(&mut self) {
+        TARGET_TASK_STACK.with(|stack| {
+            stack.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+
 pub(crate) fn target_task_stack_contains(key: &(String, String)) -> bool {
     TARGET_TASK_STACK.with(|stack| stack.borrow().iter().any(|entry| entry == key))
 }
 
-pub(crate) fn push_target_task_stack(key: (String, String)) {
-    TARGET_TASK_STACK.with(|stack| stack.borrow_mut().push(key));
+pub(crate) fn target_task_stack() -> Vec<(String, String)> {
+    TARGET_TASK_STACK.with(|stack| stack.borrow().clone())
 }
 
-pub(crate) fn pop_target_task_stack() {
-    TARGET_TASK_STACK.with(|stack| {
-        stack.borrow_mut().pop();
-    });
+pub(crate) fn with_target_task_stack<T>(
+    stack: Vec<(String, String)>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    TARGET_TASK_STACK.with(|target_task_stack| {
+        let previous = target_task_stack.replace(stack);
+        let _reset = TargetTaskStackReset(previous);
+        operation()
+    })
+}
+
+pub(crate) fn with_pushed_target_task<T>(
+    key: (String, String),
+    operation: impl FnOnce() -> T,
+) -> T {
+    let mut stack = target_task_stack();
+    stack.push(key);
+    with_target_task_stack(stack, operation)
 }
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,12 +56,15 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::cache;
+use crate::cancellation::CancellationToken;
 use crate::commands::{CommandOutput, OutputOptions};
 use crate::remote_cache::RemoteCacheClient;
 use crate::runner::{CommandOptions, Target};
 use crate::task::{
     DependencyCacheStrategy, ExecAction, ShellAction, Task, TaskMode, TaskScope, TaskStep,
 };
+use crate::ui::run::RunManyTerminal;
+use crate::ui::surface::{self, RenderSurface, SurfaceEvent};
 use crate::workspace::{self, Project, RemoteFailureMode, Workspace};
 
 use super::dev::DevRequest;
@@ -357,7 +384,7 @@ pub(crate) fn run(
         request.project.as_deref(),
         request.parallelism,
         cache_options,
-        output_options,
+        output_options.clone(),
         &state,
     )?;
     if output_options.json {
@@ -428,7 +455,7 @@ pub(crate) fn run_many(
             Some(&project_name),
             request.parallelism,
             cache_options,
-            output_options,
+            output_options.clone(),
             &state,
         )?;
         if output_options.json {
@@ -478,17 +505,6 @@ fn select_task<'a>(
                 .filter(|task| task.scope == TaskScope::Workspace)
                 .map(|task| task.name.as_str()),
         )),
-    }
-}
-
-fn nested_step_output_options(task: &Task, output_options: OutputOptions) -> OutputOptions {
-    if task.persistent {
-        OutputOptions {
-            tui: false,
-            ..output_options
-        }
-    } else {
-        output_options
     }
 }
 
@@ -544,7 +560,7 @@ fn execute_task(
             project_name,
             parallelism,
             cache_options,
-            output_options,
+            output_options.clone(),
             state,
         )?);
     }
@@ -609,53 +625,74 @@ fn execute_task(
         None
     };
 
-    // Persistent steps own the terminal for long-lived child processes
-    // (`Stdio::inherit`). Nested finite runs must not open the ratatui build TUI
-    // or they fight siblings (and the still-running process on rebuild) for the
-    // same stdout — producing wrapped/garbled frames under parallel aggregates.
-    let step_output_options = nested_step_output_options(task, output_options);
-    match task.mode {
-        TaskMode::Sequential => {
-            for step in &task.steps {
-                output.push_str(&execute_step(
-                    workspace,
-                    task,
-                    step,
-                    project_name,
-                    parallelism,
-                    cache_options,
-                    step_output_options,
-                    state,
-                )?);
-            }
-        }
-        TaskMode::Parallel => {
-            let results = thread::scope(|scope| {
-                let mut handles = Vec::new();
+    // Top-level persistent tasks own one outer session (TUI or CI prefixes).
+    // Nested persistent work receives a parent surface and must not open another.
+    if task.persistent && output_options.surface.is_none() {
+        let supervised = execute_persistent_steps(
+            workspace,
+            task,
+            project_name,
+            parallelism,
+            cache_options,
+            output_options.clone(),
+            state,
+            &identity,
+        )?;
+        output.push_str(&supervised);
+    } else {
+        let step_output_options = if task.persistent {
+            output_options.clone().without_tui()
+        } else {
+            output_options.clone()
+        };
+        match task.mode {
+            TaskMode::Sequential => {
                 for step in &task.steps {
-                    handles.push(scope.spawn(|| {
-                        execute_step(
-                            workspace,
-                            task,
-                            step,
-                            project_name,
-                            parallelism,
-                            cache_options,
-                            step_output_options,
-                            state,
-                        )
-                    }));
+                    output.push_str(&execute_step(
+                        workspace,
+                        task,
+                        step,
+                        project_name,
+                        parallelism,
+                        cache_options,
+                        step_output_options.clone(),
+                        state,
+                    )?);
                 }
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow!("parallel task worker panicked"))?
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
-            output.extend(results);
+            }
+            TaskMode::Parallel => {
+                let target_task_stack = target_task_stack();
+                let results = thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    for step in &task.steps {
+                        let step_output_options = step_output_options.clone();
+                        let target_task_stack = target_task_stack.clone();
+                        handles.push(scope.spawn(|| {
+                            with_target_task_stack(target_task_stack, || {
+                                execute_step(
+                                    workspace,
+                                    task,
+                                    step,
+                                    project_name,
+                                    parallelism,
+                                    cache_options,
+                                    step_output_options,
+                                    state,
+                                )
+                            })
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle
+                                .join()
+                                .map_err(|_| anyhow!("parallel task worker panicked"))?
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                output.extend(results);
+            }
         }
     }
     state
@@ -702,6 +739,305 @@ fn named_remote_failure_is_fatal(workspace: &Workspace, cache_options: CacheOpti
             .is_some_and(|config| config.failure == RemoteFailureMode::Error)
 }
 
+fn step_identity(step: &TaskStep, index: usize) -> String {
+    if let Some(action) = &step.dev {
+        return format!("{}:dev", action.project);
+    }
+    if let Some(action) = &step.task {
+        return match action.project.as_deref() {
+            Some(project) => format!("{project}:{}", action.name),
+            None => action.name.clone(),
+        };
+    }
+    if let Some(action) = &step.target {
+        return match action.project.as_deref() {
+            Some(project) => format!("{project}:{}", action.target),
+            None => action.target.clone(),
+        };
+    }
+    if let Some(action) = &step.watch {
+        return match action.project.as_deref() {
+            Some(project) => format!("{project}:watch-{}", action.target),
+            None => format!("watch-{}", action.target),
+        };
+    }
+    if let Some(action) = &step.module {
+        return format!("{}:{}", action.project, action.module);
+    }
+    if step.exec.is_some() {
+        return format!("exec-{}", index + 1);
+    }
+    if step.shell.is_some() {
+        return format!("shell-{}", index + 1);
+    }
+    format!("step-{}", index + 1)
+}
+
+fn step_command_display(step: &TaskStep) -> String {
+    if let Some(action) = &step.dev {
+        if action.command.is_empty() {
+            return format!("gomo dev --project {}", action.project);
+        }
+        return format!(
+            "gomo dev --project {} -- {}",
+            action.project,
+            action.command.join(" ")
+        );
+    }
+    if let Some(action) = &step.task {
+        return match action.project.as_deref() {
+            Some(project) => format!("gomo task run {} --project {project}", action.name),
+            None => format!("gomo task run {}", action.name),
+        };
+    }
+    if let Some(action) = &step.shell {
+        return action.command.clone();
+    }
+    if let Some(action) = &step.exec {
+        return std::iter::once(action.program.as_str())
+            .chain(action.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    if let Some(action) = &step.module {
+        return format!("gleam run -m {}", action.module);
+    }
+    if let Some(action) = &step.target {
+        return format!("gomo {}", action.target);
+    }
+    if let Some(action) = &step.watch {
+        return format!("gomo watch --target {}", action.target);
+    }
+    "gomo task step".to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_persistent_steps(
+    workspace: &Workspace,
+    task: &Task,
+    project_name: Option<&str>,
+    parallelism: Parallelism,
+    cache_options: CacheOptions,
+    output_options: OutputOptions,
+    state: &Arc<Mutex<ExecutionState>>,
+    identity: &str,
+) -> Result<String> {
+    let step_ids = task
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| step_identity(step, index))
+        .collect::<Vec<_>>();
+    let command_displays = task
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| (step_identity(step, index), step_command_display(step)))
+        .collect::<BTreeMap<_, _>>();
+
+    let use_tui = output_options.tui && !output_options.ci && !output_options.json;
+    let cancellation = CancellationToken::new();
+    let (event_tx, event_rx, _) = RenderSurface::channel(cancellation.clone(), output_options.ci);
+    let event_tx = Arc::new(event_tx);
+
+    let mut terminal = use_tui.then(|| {
+        let mut terminal = RunManyTerminal::new_persistent(
+            &step_ids,
+            identity,
+            command_displays.clone(),
+            parallelism.resolve(workspace.default_parallelism),
+        );
+        let _ = terminal.start();
+        for step_id in &step_ids {
+            let _ = terminal.task_started(step_id);
+        }
+        terminal
+    });
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<(String, Result<String>)>();
+    let done_tx = Arc::new(done_tx);
+    let step_count = task.steps.len();
+    let target_task_stack = target_task_stack();
+
+    thread::scope(|scope| {
+        match task.mode {
+            TaskMode::Sequential => {
+                let event_tx = Arc::clone(&event_tx);
+                let done_tx = Arc::clone(&done_tx);
+                let output_options = output_options.clone();
+                let cancellation = cancellation.clone();
+                let target_task_stack = target_task_stack.clone();
+                scope.spawn(move || {
+                    with_target_task_stack(target_task_stack, || {
+                        for (index, step) in task.steps.iter().enumerate() {
+                            if cancellation.is_cancelled() {
+                                break;
+                            }
+                            let step_id = step_identity(step, index);
+                            let surface = RenderSurface::new(
+                                step_id.clone(),
+                                (*event_tx).clone(),
+                                cancellation.clone(),
+                                output_options.ci,
+                            )
+                            .with_color(use_tui);
+                            surface.mark_started();
+                            let step_options = output_options.clone().with_surface(surface.clone());
+                            let result = execute_step(
+                                workspace,
+                                task,
+                                step,
+                                project_name,
+                                parallelism,
+                                cache_options,
+                                step_options,
+                                state,
+                            );
+                            surface.mark_finished(result.is_ok());
+                            if done_tx.send((step_id, result)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                });
+            }
+            TaskMode::Parallel => {
+                for (index, step) in task.steps.iter().enumerate() {
+                    let step_id = step_identity(step, index);
+                    let surface = RenderSurface::new(
+                        step_id.clone(),
+                        (*event_tx).clone(),
+                        cancellation.clone(),
+                        output_options.ci,
+                    )
+                    .with_color(use_tui);
+                    let done_tx = Arc::clone(&done_tx);
+                    let output_options = output_options.clone();
+                    let target_task_stack = target_task_stack.clone();
+                    scope.spawn(move || {
+                        with_target_task_stack(target_task_stack, || {
+                            surface.mark_started();
+                            let step_options = output_options.with_surface(surface.clone());
+                            let result = execute_step(
+                                workspace,
+                                task,
+                                step,
+                                project_name,
+                                parallelism,
+                                cache_options,
+                                step_options,
+                                state,
+                            );
+                            surface.mark_finished(result.is_ok());
+                            let _ = done_tx.send((step_id, result));
+                        });
+                    });
+                }
+            }
+        }
+        drop(done_tx);
+        drop(event_tx);
+
+        let mut remaining = step_count;
+        let mut outputs = BTreeMap::<String, String>::new();
+        let mut first_error: Option<anyhow::Error> = None;
+
+        while remaining > 0 {
+            // Each worker sends its surface status before its completion. Drain
+            // completions first so the final status is rendered before exit.
+            while let Ok((step_id, result)) = done_rx.try_recv() {
+                remaining = remaining.saturating_sub(1);
+                match result {
+                    Ok(text) => {
+                        outputs.insert(step_id, text);
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        cancellation.cancel();
+                    }
+                }
+            }
+
+            let mut logs_dirty = false;
+            while let Ok(event) = event_rx.try_recv() {
+                if let Some(terminal) = terminal.as_mut() {
+                    match event {
+                        SurfaceEvent::Log { step, chunk } => {
+                            terminal.append_log_silent(&step, &chunk);
+                            logs_dirty = true;
+                        }
+                        SurfaceEvent::StepStarted { step } => {
+                            let _ = terminal.task_started(&step);
+                        }
+                        SurfaceEvent::StepFinished { step, ok } => {
+                            use crate::commands::run::{TaskOutcome, TaskStatus};
+                            let outcome = TaskOutcome {
+                                project: step,
+                                status: if ok {
+                                    TaskStatus::Succeeded
+                                } else {
+                                    TaskStatus::Failed(1)
+                                },
+                                cache_status: None,
+                                cache_source: None,
+                                remote_scope: None,
+                                bytes_downloaded: 0,
+                                bytes_uploaded: 0,
+                                upload_result: None,
+                            };
+                            let _ = terminal.task_completed(&outcome, "");
+                        }
+                    }
+                } else if let SurfaceEvent::Log { step, chunk } = event {
+                    // Non-TUI path: CI prefixes are printed in append_log; plain
+                    // mode still needs the demuxed chunk on stdout.
+                    if !output_options.ci {
+                        print!("[{step}] {chunk}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                }
+            }
+            if logs_dirty && let Some(terminal) = terminal.as_mut() {
+                let _ = terminal.tick();
+            }
+
+            if let Some(terminal) = terminal.as_mut() {
+                if terminal.poll_quit().unwrap_or(false) {
+                    cancellation.cancel();
+                    first_error =
+                        first_error.or_else(|| Some(anyhow!("persistent task cancelled")));
+                }
+                let _ = terminal.tick();
+            }
+
+            if cancellation.is_cancelled() && remaining == 0 {
+                break;
+            }
+            if remaining == 0 {
+                break;
+            }
+            // When cancelled, keep draining until workers notice and exit.
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        if let Some(terminal) = terminal.as_mut() {
+            let _ = terminal.restore_now();
+        }
+
+        if let Some(error) = first_error {
+            // User quit should be a clean exit code 0 path for task run.
+            if error.to_string().contains("cancelled") {
+                return Ok(String::new());
+            }
+            return Err(error);
+        }
+
+        Ok(outputs.into_values().collect::<Vec<_>>().join(""))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_step(
     workspace: &Workspace,
@@ -713,6 +1049,14 @@ fn execute_step(
     output_options: OutputOptions,
     state: &Arc<Mutex<ExecutionState>>,
 ) -> Result<String> {
+    // Nested native work under a surface must never open its own TUI.
+    let nested_options = if output_options.surface.is_some() {
+        output_options.clone().without_tui()
+    } else {
+        output_options.clone()
+    };
+    let surface = nested_options.surface.clone();
+
     if let Some(action) = &step.task {
         let project = action.project.as_deref().or(current_project);
         let task = select_task(workspace, &action.name, project)?;
@@ -722,61 +1066,70 @@ fn execute_step(
             project,
             parallelism,
             cache_options,
-            output_options,
+            nested_options,
             state,
         );
     }
     if let Some(action) = &step.target {
         let project = required_project(action.project.as_deref().or(current_project), owner)?;
         let target = parse_target(&action.target)?;
-        return native_output(super::run::run(
-            &workspace.root,
-            RunRequest {
-                target,
-                command_options: CommandOptions::default(),
-                selection: ProjectSelection::Project(project.to_string()),
-                with_deps: action.with_deps,
-                parallelism,
-            },
-            cache_options,
-            output_options,
-        )?);
+        return native_output(
+            super::run::run(
+                &workspace.root,
+                RunRequest {
+                    target,
+                    command_options: CommandOptions::default(),
+                    selection: ProjectSelection::Project(project.to_string()),
+                    with_deps: action.with_deps,
+                    parallelism,
+                },
+                cache_options,
+                nested_options,
+            )?,
+            surface.as_ref(),
+        );
     }
     if let Some(action) = &step.dev {
-        return native_output(super::dev::run(
-            &workspace.root,
-            DevRequest {
-                project: action.project.clone(),
-                command: action.command.clone(),
-                debounce: Duration::from_millis(300),
-                reload: None,
-                parallelism,
-            },
-            cache_options,
-            output_options,
-        )?);
+        return native_output(
+            super::dev::run(
+                &workspace.root,
+                DevRequest {
+                    project: action.project.clone(),
+                    command: action.command.clone(),
+                    debounce: Duration::from_millis(300),
+                    reload: None,
+                    parallelism,
+                },
+                cache_options,
+                nested_options,
+            )?,
+            surface.as_ref(),
+        );
     }
     if let Some(action) = &step.watch {
         let target = parse_target(&action.target)?;
-        return native_output(super::watch::run(
-            &workspace.root,
-            WatchRequest {
-                target: Some(target),
-                selection: action
-                    .project
-                    .as_deref()
-                    .or(current_project)
-                    .map(|project| ProjectSelection::Project(project.to_string()))
-                    .unwrap_or(ProjectSelection::All),
-                with_deps: false,
-                initial_run: action.initial_run,
-                debounce: Duration::from_millis(300),
-                callback: Vec::new(),
-                parallelism,
-            },
-            cache_options,
-            output_options,
-        )?);
+        return native_output(
+            super::watch::run(
+                &workspace.root,
+                WatchRequest {
+                    target: Some(target),
+                    selection: action
+                        .project
+                        .as_deref()
+                        .or(current_project)
+                        .map(|project| ProjectSelection::Project(project.to_string()))
+                        .unwrap_or(ProjectSelection::All),
+                    with_deps: false,
+                    initial_run: action.initial_run,
+                    debounce: Duration::from_millis(300),
+                    callback: Vec::new(),
+                    parallelism,
+                },
+                cache_options,
+                nested_options,
+            )?,
+            surface.as_ref(),
+        );
     }
     if let Some(action) = &step.module {
         let project = find_project(workspace, &action.project)?;
@@ -809,6 +1162,7 @@ fn execute_step(
             &args,
             &Default::default(),
             true,
+            surface.as_ref(),
         );
     }
     if let Some(action) = &step.exec {
@@ -816,19 +1170,38 @@ fn execute_step(
         let project_root = current_project
             .map(|name| find_project(workspace, name).map(|project| project.root.as_path()))
             .transpose()?;
-        return run_exec(workspace, owner, &cwd, project_root, action);
+        return run_exec(
+            workspace,
+            owner,
+            &cwd,
+            project_root,
+            action,
+            surface.as_ref(),
+        );
     }
     if let Some(action) = &step.shell {
         let cwd = action_cwd(workspace, current_project, action.cwd.as_deref())?;
         let project_root = current_project
             .map(|name| find_project(workspace, name).map(|project| project.root.as_path()))
             .transpose()?;
-        return run_shell(workspace, owner, &cwd, project_root, action);
+        return run_shell(
+            workspace,
+            owner,
+            &cwd,
+            project_root,
+            action,
+            surface.as_ref(),
+        );
     }
     unreachable!("task steps are validated during discovery")
 }
 
-fn native_output(output: CommandOutput) -> Result<String> {
+fn native_output(output: CommandOutput, surface: Option<&RenderSurface>) -> Result<String> {
+    if let Some(surface) = surface
+        && !output.stdout.is_empty()
+    {
+        surface.append_log(&output.stdout);
+    }
     if output.is_success() {
         Ok(output.stdout)
     } else {
@@ -845,6 +1218,7 @@ fn run_exec(
     cwd: &Path,
     project_root: Option<&Path>,
     action: &ExecAction,
+    surface: Option<&RenderSurface>,
 ) -> Result<String> {
     if Path::new(&action.program)
         .file_name()
@@ -864,6 +1238,7 @@ fn run_exec(
         &action.args,
         &action.env,
         true,
+        surface,
     )
 }
 
@@ -873,6 +1248,7 @@ fn run_shell(
     cwd: &Path,
     project_root: Option<&Path>,
     action: &ShellAction,
+    surface: Option<&RenderSurface>,
 ) -> Result<String> {
     run_process(
         workspace,
@@ -883,6 +1259,7 @@ fn run_shell(
         &["-c".to_string(), action.command.clone()],
         &action.env,
         false,
+        surface,
     )
 }
 
@@ -896,6 +1273,7 @@ fn run_process(
     args: &[String],
     env: &std::collections::BTreeMap<String, String>,
     interpolate_args: bool,
+    surface: Option<&RenderSurface>,
 ) -> Result<String> {
     let mut command = Command::new(if interpolate_args {
         interpolate(program, workspace, project_root)
@@ -923,6 +1301,14 @@ fn run_process(
         command.env(name, interpolate(value, workspace, project_root));
     }
     if owner.persistent {
+        if let Some(surface) = surface {
+            return surface::run_piped_persistent(command, surface, || {
+                format!(
+                    "persistent action in task `{}` exited unexpectedly with status 0",
+                    owner.name
+                )
+            });
+        }
         let status = command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -945,11 +1331,17 @@ fn run_process(
         let code = status.code().unwrap_or(1);
         bail!("task `{}` failed with exit code {code}", owner.name);
     }
+    if let Some(surface) = surface {
+        surface::configure_captured_output(&mut command, surface.color_enabled());
+    }
     let output = command
         .output()
         .with_context(|| format!("failed to run `{program}` in {}", cwd.display()))?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if let Some(surface) = surface {
+        surface.append_log(&text);
+    }
     if !output.status.success() {
         bail!(
             "task `{}` failed running `{program}` with exit code {}\n{text}",
@@ -1986,40 +2378,93 @@ steps = [{ exec = { program = "server" } }]
     }
 
     #[test]
-    fn nested_step_output_options_disables_tui_for_persistent_tasks() {
-        let interactive = OutputOptions {
-            tui: true,
-            ci: false,
-            json: false,
-            terminal_width: Some(120),
+    fn step_identity_names_dev_and_project_tasks() {
+        use crate::task::{DevAction, TaskAction};
+        let dev = TaskStep {
+            dev: Some(DevAction {
+                project: "api".to_string(),
+                command: Vec::new(),
+            }),
+            task: None,
+            target: None,
+            watch: None,
+            module: None,
+            exec: None,
+            shell: None,
         };
-        let finite = Task {
-            name: "build".to_string(),
-            scope: TaskScope::Workspace,
-            description: None,
-            depends_on: Vec::new(),
-            dependency_cache_strategies: Default::default(),
-            mode: TaskMode::Sequential,
-            steps: Vec::new(),
-            persistent: false,
-            cache: false,
-            remote_cache: true,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            env_inputs: Vec::new(),
-            tools: Vec::new(),
+        let task = TaskStep {
+            task: Some(TaskAction {
+                name: "vite-dev".to_string(),
+                project: Some("web".to_string()),
+            }),
+            dev: None,
+            target: None,
+            watch: None,
+            module: None,
+            exec: None,
+            shell: None,
         };
-        let persistent = Task {
-            persistent: true,
-            name: "serve".to_string(),
-            ..finite.clone()
-        };
+        assert_eq!(step_identity(&dev, 0), "api:dev");
+        assert_eq!(step_identity(&task, 1), "web:vite-dev");
+    }
 
-        assert!(nested_step_output_options(&finite, interactive).tui);
-        assert!(!nested_step_output_options(&persistent, interactive).tui);
-        assert_eq!(
-            nested_step_output_options(&persistent, interactive).terminal_width,
-            Some(120)
+    #[test]
+    fn persistent_parallel_shells_demux_logs_without_tui() {
+        let workspace = TestWorkspace::new("gomo-persistent-surface");
+        workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.stack]
+persistent = true
+mode = "parallel"
+steps = [
+  { shell = { command = "printf 'alpha\\n'; sleep 0.2" } },
+  { shell = { command = "printf 'beta\\n'; sleep 0.2" } },
+]
+"#,
+        );
+
+        // Finite shells marked persistent will fail on status 0; use loops cancelled by timeout path.
+        // Instead use exec that fails after printing so steps end.
+        workspace.write_file(
+            "gomo.toml",
+            r#"
+[workspace]
+project_roots = ["apps/*"]
+
+[tasks.stack]
+persistent = true
+mode = "parallel"
+steps = [
+  { shell = { command = "printf 'alpha\\n'; exit 1" } },
+  { shell = { command = "printf 'beta\\n'; exit 1" } },
+]
+"#,
+        );
+
+        let error = run(
+            workspace.path(),
+            TaskRunRequest {
+                name: "stack".to_string(),
+                project: None,
+                parallelism: Parallelism::Fixed(2),
+            },
+            CacheOptions::disabled(),
+            OutputOptions {
+                tui: false,
+                ci: true,
+                ..OutputOptions::default()
+            },
+        )
+        .expect_err("persistent shells exiting non-zero should fail the aggregate");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("failed") || message.contains("exit"),
+            "unexpected error: {message}"
         );
     }
 

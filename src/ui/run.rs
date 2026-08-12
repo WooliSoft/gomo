@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -28,10 +28,11 @@ use crate::runner::Target;
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const LONG_LIVED_SPINNER_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub(crate) struct RunManyControl {
-    input: Arc<Mutex<mpsc::Receiver<KeyCode>>>,
+    input: Arc<Mutex<mpsc::Receiver<KeyEvent>>>,
     continuous: bool,
     cancellation: CancellationToken,
     idle_terminal: Weak<Mutex<Option<RunManyTerminal>>>,
@@ -107,7 +108,7 @@ impl RunManyControl {
 
 #[derive(Clone)]
 pub(crate) struct RunManySession {
-    input: mpsc::Sender<KeyCode>,
+    input: mpsc::Sender<KeyEvent>,
     cancellation: CancellationToken,
     idle_terminal: Arc<Mutex<Option<RunManyTerminal>>>,
 }
@@ -138,15 +139,19 @@ impl RunManySession {
     }
 
     pub(crate) fn handle_key(&self, code: KeyCode) -> io::Result<()> {
+        self.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    pub(crate) fn handle_key_event(&self, key: KeyEvent) -> io::Result<()> {
         let mut idle_terminal = self
             .idle_terminal
             .lock()
             .map_err(|_| io::Error::other("run TUI state lock was poisoned"))?;
         if let Some(terminal) = idle_terminal.as_mut() {
-            terminal.handle_key(code);
+            terminal.handle_key_event(key);
             terminal.draw()
         } else {
-            let _ = self.input.send(code);
+            let _ = self.input.send(key);
             Ok(())
         }
     }
@@ -164,15 +169,21 @@ impl RunManySession {
 
 pub(crate) struct RunManyTerminal {
     target: Target,
+    /// Overrides the summary header label (e.g. task name for persistent sessions).
+    title_override: Option<String>,
     command_displays: BTreeMap<String, String>,
     project_names: Vec<String>,
     rows: BTreeMap<String, TaskRow>,
     logs: BTreeMap<String, String>,
     selected_index: usize,
     fullscreen_logs: bool,
+    log_scroll_end: Option<usize>,
+    log_line_count: usize,
+    log_viewport_lines: usize,
     parallelism: usize,
     started_at: Instant,
     spinner_frame: usize,
+    spinner_advanced_at: Instant,
     completed: usize,
     succeeded: usize,
     failed: usize,
@@ -181,6 +192,9 @@ pub(crate) struct RunManyTerminal {
     summary: Option<TaskSummary>,
     exit_prompt: Option<ExitPrompt>,
     waiting: bool,
+    shutting_down: bool,
+    /// When true, `q` exits immediately (persistent task supervisor).
+    immediate_quit: bool,
     watch_error: Option<String>,
     terminal: Option<TuiTerminal>,
     raw_mode_enabled: bool,
@@ -212,15 +226,20 @@ impl RunManyTerminal {
 
         Self {
             target,
+            title_override: None,
             command_displays,
             project_names: project_names.to_vec(),
             rows,
             logs: BTreeMap::new(),
             selected_index: 0,
             fullscreen_logs: false,
+            log_scroll_end: None,
+            log_line_count: 0,
+            log_viewport_lines: 0,
             parallelism,
             started_at: Instant::now(),
             spinner_frame: 0,
+            spinner_advanced_at: Instant::now(),
             completed: 0,
             succeeded: 0,
             failed: 0,
@@ -229,11 +248,32 @@ impl RunManyTerminal {
             summary: None,
             exit_prompt: None,
             waiting: false,
+            shutting_down: false,
+            immediate_quit: false,
             watch_error: None,
             terminal: None,
             raw_mode_enabled: false,
             control,
         }
+    }
+
+    /// Persistent-task supervisor: same look as finite runs, `q` exits immediately.
+    pub(crate) fn new_persistent(
+        step_names: &[String],
+        title: impl Into<String>,
+        command_displays: BTreeMap<String, String>,
+        parallelism: usize,
+    ) -> Self {
+        let mut terminal = Self::new_with_control(
+            step_names,
+            Target::Build,
+            command_displays,
+            parallelism,
+            None,
+        );
+        terminal.title_override = Some(title.into());
+        terminal.immediate_quit = true;
+        terminal
     }
 
     pub(crate) fn start(&mut self) -> io::Result<()> {
@@ -294,6 +334,28 @@ impl RunManyTerminal {
         self.draw()
     }
 
+    pub(crate) fn append_log_silent(&mut self, project: &str, chunk: &str) {
+        self.logs
+            .entry(project.to_string())
+            .or_default()
+            .push_str(chunk);
+    }
+
+    pub(crate) fn poll_quit(&mut self) -> io::Result<bool> {
+        while let Some(key) = self.next_key(Duration::from_millis(0))? {
+            if self.handle_key_event(key) {
+                self.begin_shutdown();
+                self.draw()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn restore_now(&mut self) -> io::Result<()> {
+        self.restore()
+    }
+
     pub(crate) fn task_skipped(&mut self, outcome: &TaskOutcome) -> io::Result<()> {
         self.handle_input()?;
         self.finish_row(outcome);
@@ -302,7 +364,12 @@ impl RunManyTerminal {
 
     pub(crate) fn tick(&mut self) -> io::Result<()> {
         self.handle_input()?;
-        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        if !self.is_long_lived()
+            || self.spinner_advanced_at.elapsed() >= LONG_LIVED_SPINNER_INTERVAL
+        {
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            self.spinner_advanced_at = Instant::now();
+        }
         self.draw()
     }
 
@@ -345,6 +412,15 @@ impl RunManyTerminal {
         }
     }
 
+    fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        for row in self.rows.values_mut() {
+            if row.status == TaskRowStatus::Running {
+                row.status = TaskRowStatus::Stopping;
+            }
+        }
+    }
+
     fn finish_row(&mut self, outcome: &TaskOutcome) {
         let duration = self
             .rows
@@ -356,6 +432,9 @@ impl RunManyTerminal {
         if let Some(row) = self.rows.get_mut(&outcome.project) {
             row.duration = Some(duration);
             row.cache_status = outcome.cache_status;
+            if self.shutting_down {
+                return;
+            }
             row.status = match outcome.status {
                 TaskStatus::Succeeded if outcome.cache_status == Some(TaskCacheStatus::Hit) => {
                     TaskRowStatus::Cached
@@ -409,10 +488,18 @@ impl RunManyTerminal {
             .is_some_and(|control| control.continuous)
     }
 
+    fn shows_elapsed(&self) -> bool {
+        !self.is_long_lived()
+    }
+
+    fn is_long_lived(&self) -> bool {
+        self.immediate_quit || self.is_continuous()
+    }
+
     fn wait_for_exit_confirmation(&mut self) -> io::Result<RunManyExit> {
         loop {
-            if let Some(code) = self.next_key(Duration::from_millis(250))? {
-                if self.handle_key(code) {
+            if let Some(key) = self.next_key(Duration::from_millis(250))? {
+                if self.handle_key_event(key) {
                     return Ok(RunManyExit::UserExited);
                 }
                 self.draw()?;
@@ -425,20 +512,20 @@ impl RunManyTerminal {
             return Ok(());
         }
 
-        while let Some(code) = self.next_key(Duration::from_millis(0))? {
-            self.handle_key(code);
+        while let Some(key) = self.next_key(Duration::from_millis(0))? {
+            self.handle_key_event(key);
         }
 
         Ok(())
     }
 
-    fn next_key(&self, timeout: Duration) -> io::Result<Option<KeyCode>> {
+    fn next_key(&self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
         let Some(control) = self.control.as_ref() else {
             if !event::poll(timeout)? {
                 return Ok(None);
             }
             return Ok(match event::read()? {
-                Event::Key(key) => Some(key.code),
+                Event::Key(key) if key.kind == KeyEventKind::Press => Some(key),
                 _ => None,
             });
         };
@@ -447,7 +534,7 @@ impl RunManyTerminal {
             .lock()
             .map_err(|_| io::Error::other("run TUI input channel lock was poisoned"))?;
         match receiver.recv_timeout(timeout) {
-            Ok(code) => Ok(Some(code)),
+            Ok(key) => Ok(Some(key)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -456,8 +543,14 @@ impl RunManyTerminal {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> bool {
-        match code {
+    fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if self.immediate_quit && is_persistent_quit_key(key) {
+            return true;
+        }
+        match key.code {
             KeyCode::Enter
                 if self.summary.is_some() && self.exit_prompt == Some(ExitPrompt::Cancelled) =>
             {
@@ -467,23 +560,43 @@ impl RunManyTerminal {
             KeyCode::Char('q') if self.summary.is_some() => return true,
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 self.fullscreen_logs = !self.fullscreen_logs;
+                self.log_scroll_end = None;
             }
             KeyCode::Esc if self.fullscreen_logs => {
                 self.fullscreen_logs = false;
+                self.log_scroll_end = None;
             }
             KeyCode::Esc if self.summary.is_some() => return true,
+            KeyCode::Char('k') if self.fullscreen_logs => {
+                let minimum_end = self.log_viewport_lines.min(self.log_line_count);
+                let current_end = self.log_scroll_end.unwrap_or(self.log_line_count);
+                let next_end = current_end.saturating_sub(1).max(minimum_end);
+                self.log_scroll_end = (next_end < self.log_line_count).then_some(next_end);
+            }
+            KeyCode::Char('j') if self.fullscreen_logs => {
+                if let Some(current_end) = self.log_scroll_end {
+                    let next_end = current_end.saturating_add(1);
+                    self.log_scroll_end = (next_end < self.log_line_count).then_some(next_end);
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected_index = self.selected_index.saturating_sub(1);
+                self.log_scroll_end = None;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.project_names.is_empty() {
                     self.selected_index =
                         (self.selected_index + 1).min(self.project_names.len() - 1);
+                    self.log_scroll_end = None;
                 }
             }
-            KeyCode::Home => self.selected_index = 0,
+            KeyCode::Home => {
+                self.selected_index = 0;
+                self.log_scroll_end = None;
+            }
             KeyCode::End if !self.project_names.is_empty() => {
                 self.selected_index = self.project_names.len() - 1;
+                self.log_scroll_end = None;
             }
             _ => {}
         }
@@ -528,6 +641,7 @@ enum TaskRowStatus {
     Waiting,
     Pending,
     Running,
+    Stopping,
     Succeeded,
     Cached,
     Failed(i32),
@@ -580,22 +694,23 @@ pub(crate) fn render_terminal_summary(summary: &TaskSummary) -> String {
     output
 }
 
-fn render(frame: &mut Frame<'_>, app: &RunManyTerminal) {
+fn render(frame: &mut Frame<'_>, app: &mut RunManyTerminal) {
     if app.fullscreen_logs {
         render_fullscreen_logs(frame, frame.area(), app);
         return;
     }
 
+    let summary_height = if app.shows_elapsed() { 8 } else { 7 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(12), Constraint::Length(8)])
+        .constraints([Constraint::Min(12), Constraint::Length(summary_height)])
         .split(frame.area());
 
     render_body(frame, outer[0], app);
     render_run_summary(frame, outer[1], app);
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut RunManyTerminal) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
@@ -653,7 +768,7 @@ fn render_task_table(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
     frame.render_widget(table, area);
 }
 
-fn render_log_panel(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
+fn render_log_panel(frame: &mut Frame<'_>, area: Rect, app: &mut RunManyTerminal) {
     let lines = log_lines(app, area.height.saturating_sub(2) as usize);
     let panel = Paragraph::new(lines)
         .block(
@@ -666,7 +781,7 @@ fn render_log_panel(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
     frame.render_widget(panel, area);
 }
 
-fn render_fullscreen_logs(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
+fn render_fullscreen_logs(frame: &mut Frame<'_>, area: Rect, app: &mut RunManyTerminal) {
     let selected = app.selected_project().unwrap_or("-");
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -696,10 +811,12 @@ fn log_title(app: &RunManyTerminal, project: &str) -> Line<'static> {
         styled(task_id(project, app.target), Color::White, Modifier::BOLD),
     ];
     append_cache_title(app, project, &mut title);
+    title.push(raw("  "));
+    title.push(dim(key_hint(app)));
     Line::from(title)
 }
 
-fn log_lines(app: &RunManyTerminal, max_lines: usize) -> Vec<Line<'static>> {
+fn log_lines(app: &mut RunManyTerminal, max_lines: usize) -> Vec<Line<'static>> {
     let selected = app.selected_project().unwrap_or("-");
     let output = app
         .logs
@@ -718,7 +835,13 @@ fn log_lines(app: &RunManyTerminal, max_lines: usize) -> Vec<Line<'static>> {
             }
         });
     let output = filter_log_metadata(output);
-    ansi_log_lines(&output, max_lines.max(1))
+    let max_lines = max_lines.max(1);
+    let requested_end = app.log_scroll_end;
+    let (lines, line_count, end) = ansi_log_lines(&output, max_lines, requested_end);
+    app.log_line_count = line_count;
+    app.log_viewport_lines = max_lines;
+    app.log_scroll_end = requested_end.and_then(|_| (end < line_count).then_some(end));
+    lines
 }
 
 fn cached_log_output(output: &str, command_display: &str) -> String {
@@ -762,7 +885,11 @@ fn is_hidden_cached_output_line(line: &str, command_display: &str) -> bool {
         || is_hidden_log_metadata(line)
 }
 
-fn ansi_log_lines(input: &str, max_lines: usize) -> Vec<Line<'static>> {
+fn ansi_log_lines(
+    input: &str,
+    max_lines: usize,
+    requested_end: Option<usize>,
+) -> (Vec<Line<'static>>, usize, usize) {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut text = String::new();
@@ -786,11 +913,13 @@ fn ansi_log_lines(input: &str, max_lines: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
 
-    if lines.len() > max_lines {
-        lines.split_off(lines.len() - max_lines)
-    } else {
-        lines
-    }
+    let line_count = lines.len();
+    let minimum_end = max_lines.min(line_count);
+    let end = requested_end
+        .unwrap_or(line_count)
+        .clamp(minimum_end, line_count);
+    let start = end.saturating_sub(max_lines);
+    (lines.drain(start..end).collect(), line_count, end)
 }
 
 fn handle_ansi_escape(
@@ -967,43 +1096,68 @@ fn extended_ansi_color(codes: &[u16]) -> Option<(Color, usize)> {
 }
 
 fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) {
-    let running = app
+    let has_live_failure = app
         .rows
         .values()
-        .filter(|row| row.status == TaskRowStatus::Running)
-        .count();
-    let remaining = app.project_names.len().saturating_sub(app.completed);
-    let status_color = if app.failed > 0 || app.watch_error.is_some() {
+        .any(|row| matches!(row.status, TaskRowStatus::Failed(_)));
+    let status_color = if app.watch_error.is_some()
+        || if app.is_long_lived() {
+            has_live_failure
+        } else {
+            app.failed > 0
+        } {
         Color::Red
     } else if app.summary.is_some() {
         Color::Green
     } else {
         Color::Cyan
     };
-    let percentage = if app.project_names.is_empty() {
-        100
+    let mut lines = if app.is_long_lived() {
+        long_lived_summary_lines(app, status_color)
     } else {
-        app.completed * 100 / app.project_names.len()
+        finite_summary_lines(app, status_color)
     };
-    let progress = if app.waiting {
-        Line::from(vec![
-            dim("Watch"),
-            raw("     "),
-            styled("waiting for changes", Color::Cyan, Modifier::BOLD),
-        ])
-    } else {
-        Line::from(vec![
-            dim("Progress"),
-            raw("  "),
-            styled(
-                format!("{} / {} complete", app.completed, app.project_names.len()),
-                status_color,
-                Modifier::BOLD,
-            ),
-            dim(format!("  {percentage}%")),
-        ])
-    };
-    let watch_notice = app.watch_error.as_ref().map_or_else(
+    lines.push(Line::from(vec![
+        dim("Keys"),
+        raw("      "),
+        raw(key_hint(app)),
+    ]));
+    let summary = Paragraph::new(lines)
+        .block(
+            Block::bordered()
+                .title(" Summary ")
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::DarkGray)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(summary, area);
+}
+
+fn long_lived_summary_header(
+    app: &RunManyTerminal,
+    status_color: Color,
+    item_label: &str,
+) -> Line<'static> {
+    Line::from(vec![
+        styled("Gomo", status_color, Modifier::BOLD),
+        raw(" "),
+        styled(
+            app.title_override
+                .clone()
+                .unwrap_or_else(|| app.target.as_str().to_string()),
+            Color::White,
+            Modifier::BOLD,
+        ),
+        dim(format!(
+            "  {} {item_label}  parallel {}",
+            app.project_names.len(),
+            app.parallelism
+        )),
+    ])
+}
+
+fn watch_notice(app: &RunManyTerminal) -> Line<'static> {
+    app.watch_error.as_ref().map_or_else(
         || Line::from(""),
         |message| {
             Line::from(vec![
@@ -1012,12 +1166,128 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
                 styled(message.clone(), Color::Red, Modifier::BOLD),
             ])
         },
-    );
-    let lines = vec![
+    )
+}
+
+fn long_lived_summary_lines(app: &RunManyTerminal, status_color: Color) -> Vec<Line<'static>> {
+    let count = |status| app.rows.values().filter(|row| row.status == status).count();
+    let waiting = count(TaskRowStatus::Waiting);
+    let queued = count(TaskRowStatus::Pending);
+    let running = count(TaskRowStatus::Running);
+    let stopping = count(TaskRowStatus::Stopping);
+    let finished = count(TaskRowStatus::Succeeded)
+        + count(TaskRowStatus::Cached)
+        + count(TaskRowStatus::Skipped);
+    let failed = app
+        .rows
+        .values()
+        .filter(|row| matches!(row.status, TaskRowStatus::Failed(_)))
+        .count();
+    let status = if app.waiting || waiting > 0 {
+        "waiting for changes"
+    } else if stopping > 0 || app.shutting_down {
+        "stopping"
+    } else if running > 0 {
+        if failed > 0 {
+            "running with failures"
+        } else {
+            "running"
+        }
+    } else if failed > 0 {
+        if app.is_continuous() {
+            "cycle failed"
+        } else {
+            "failed"
+        }
+    } else if queued > 0 {
+        if finished > 0 { "running" } else { "starting" }
+    } else if app.is_continuous() {
+        "cycle complete"
+    } else if finished > 0 {
+        "stopped"
+    } else {
+        "starting"
+    };
+    let (item_label, item_count_label) = if app.is_continuous() {
+        ("Projects", "projects")
+    } else {
+        ("Services", "services")
+    };
+
+    let mut lines = vec![
+        long_lived_summary_header(app, status_color, item_count_label),
+        watch_notice(app),
+        Line::from(vec![
+            dim("Status"),
+            raw("    "),
+            styled(status, status_color, Modifier::BOLD),
+        ]),
+    ];
+    lines.push(if app.is_continuous() {
+        Line::from(vec![
+            dim(item_label),
+            raw("  "),
+            styled(format!("watching {waiting}"), Color::Cyan, Modifier::BOLD),
+            raw("   "),
+            styled(format!("running {running}"), Color::Green, Modifier::BOLD),
+            raw("   "),
+            dim(format!("queued {queued}")),
+            raw("   "),
+            dim(format!("done {finished}")),
+            raw("   "),
+            styled(format!("failed {failed}"), Color::Red, Modifier::BOLD),
+        ])
+    } else {
+        Line::from(vec![
+            dim(item_label),
+            raw("  "),
+            styled(format!("running {running}"), Color::Green, Modifier::BOLD),
+            raw("   "),
+            dim(format!("queued {queued}")),
+            raw("   "),
+            dim(format!("stopping {stopping}")),
+            raw("   "),
+            dim(format!("stopped {finished}")),
+            raw("   "),
+            styled(format!("failed {failed}"), Color::Red, Modifier::BOLD),
+        ])
+    });
+    lines
+}
+
+fn finite_summary_lines(app: &RunManyTerminal, status_color: Color) -> Vec<Line<'static>> {
+    let running = app
+        .rows
+        .values()
+        .filter(|row| row.status == TaskRowStatus::Running)
+        .count();
+    let remaining = app.project_names.len().saturating_sub(app.completed);
+    let percentage = if app.project_names.is_empty() {
+        100
+    } else {
+        app.completed * 100 / app.project_names.len()
+    };
+    let progress = Line::from(vec![
+        dim("Progress"),
+        raw("  "),
+        styled(
+            format!("{} / {} complete", app.completed, app.project_names.len()),
+            status_color,
+            Modifier::BOLD,
+        ),
+        dim(format!("  {percentage}%")),
+    ]);
+    let mut lines = vec![
         Line::from(vec![
             styled("Gomo", status_color, Modifier::BOLD),
             raw(" "),
-            styled(app.target.as_str(), Color::White, Modifier::BOLD),
+            styled(
+                app.title_override
+                    .clone()
+                    .unwrap_or_else(|| app.target.as_str().to_string()),
+                Color::White,
+                Modifier::BOLD,
+            ),
             dim(format!(
                 "  {} total  {} running  {} remaining  parallel {}",
                 app.project_names.len(),
@@ -1026,7 +1296,7 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
                 app.parallelism
             )),
         ]),
-        watch_notice,
+        watch_notice(app),
         progress,
         Line::from(vec![
             dim("Results"),
@@ -1047,26 +1317,30 @@ fn render_run_summary(frame: &mut Frame<'_>, area: Rect, app: &RunManyTerminal) 
             raw("   "),
             dim(format!("skipped {}", app.skipped)),
         ]),
-        Line::from(vec![
+    ];
+    if app.shows_elapsed() {
+        lines.push(Line::from(vec![
             dim("Elapsed"),
             raw("   "),
             raw(pretty_duration(app.started_at.elapsed())),
-        ]),
-        Line::from(vec![dim("Keys"), raw("      "), raw(key_hint(app))]),
-    ];
-    let summary = Paragraph::new(lines)
-        .block(
-            Block::bordered()
-                .title(" Summary ")
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(Color::DarkGray)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(summary, area);
+        ]));
+    }
+    lines
+}
+
+fn is_persistent_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q' | 'Q')) && key.modifiers.is_empty()
+        || matches!(key.code, KeyCode::Char('c')) && key.modifiers == KeyModifiers::CONTROL
 }
 
 fn key_hint(app: &RunManyTerminal) -> &'static str {
-    if app
+    if app.fullscreen_logs && app.immediate_quit {
+        "j/k scroll, ↑/↓ select, L/Esc back, q or Ctrl-C exit"
+    } else if app.fullscreen_logs {
+        "j/k scroll, ↑/↓ select, L/Esc back"
+    } else if app.immediate_quit {
+        "↑/↓ or j/k select, L logs, q or Ctrl-C exit"
+    } else if app
         .control
         .as_ref()
         .is_some_and(|control| control.continuous)
@@ -1095,6 +1369,7 @@ fn status_spans(status: TaskRowStatus, spinner_frame: usize) -> Vec<Span<'static
             ),
             raw(" running"),
         ],
+        TaskRowStatus::Stopping => vec![dim("stopping")],
         TaskRowStatus::Succeeded => vec![styled("✓", Color::Green, Modifier::BOLD), raw(" ok")],
         TaskRowStatus::Cached => vec![styled("✓", Color::Green, Modifier::BOLD), raw(" cached")],
         TaskRowStatus::Failed(_) => vec![styled("✗", Color::Red, Modifier::BOLD), raw(" failed")],
@@ -1179,8 +1454,153 @@ mod tests {
     }
 
     #[test]
+    fn hides_elapsed_for_long_lived_sessions() {
+        let finite = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            None,
+        );
+        let persistent =
+            RunManyTerminal::new_persistent(&["one".to_string()], "dev", BTreeMap::new(), 1);
+        let (_session, control) = RunManySession::continuous();
+        let watch = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            Some(control),
+        );
+
+        assert!(finite.shows_elapsed());
+        assert!(!persistent.shows_elapsed());
+        assert!(!watch.shows_elapsed());
+    }
+
+    #[test]
+    fn long_lived_summaries_show_lifecycle_instead_of_completion() {
+        let mut persistent = RunManyTerminal::new_persistent(
+            &["api".to_string(), "web".to_string()],
+            "dev",
+            BTreeMap::new(),
+            2,
+        );
+        persistent.rows.get_mut("api").unwrap().status = TaskRowStatus::Running;
+        let persistent_text = line_text(&long_lived_summary_lines(&persistent, Color::Cyan));
+
+        assert!(persistent_text.contains("2 services"));
+        assert!(persistent_text.contains("Status    running"));
+        assert!(persistent_text.contains("Services  running 1   queued 1"));
+        assert!(!persistent_text.contains("Progress"));
+        assert!(!persistent_text.contains("Results"));
+
+        let (_session, control) = RunManySession::continuous();
+        let mut watch = RunManyTerminal::new_with_control(
+            &["one".to_string(), "two".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            2,
+            Some(control),
+        );
+        watch.set_waiting();
+        let watch_text = line_text(&long_lived_summary_lines(&watch, Color::Cyan));
+
+        assert!(watch_text.contains("2 projects"));
+        assert!(watch_text.contains("Status    waiting for changes"));
+        assert!(watch_text.contains("Projects  watching 2"));
+        assert!(!watch_text.contains("complete"));
+
+        watch.waiting = false;
+        watch.rows.get_mut("one").unwrap().status = TaskRowStatus::Succeeded;
+        watch.rows.get_mut("two").unwrap().status = TaskRowStatus::Pending;
+        let watch_text = line_text(&long_lived_summary_lines(&watch, Color::Cyan));
+        assert!(watch_text.contains("Status    running"));
+        assert!(watch_text.contains("queued 1   done 1"));
+
+        persistent.rows.get_mut("api").unwrap().status = TaskRowStatus::Succeeded;
+        persistent.rows.get_mut("web").unwrap().status = TaskRowStatus::Succeeded;
+        let persistent_text = line_text(&long_lived_summary_lines(&persistent, Color::Cyan));
+        assert!(persistent_text.contains("Status    stopped"));
+        assert!(persistent_text.contains("stopped 2"));
+    }
+
+    #[test]
+    fn finite_summary_keeps_completion_metrics() {
+        let finite = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            None,
+        );
+        let text = line_text(&finite_summary_lines(&finite, Color::Cyan));
+
+        assert!(text.contains("Progress"));
+        assert!(text.contains("Results"));
+        assert!(text.contains("Elapsed"));
+    }
+
+    fn line_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn slows_spinner_for_long_lived_sessions() {
+        let mut finite = RunManyTerminal::new_with_control(
+            &["one".to_string()],
+            Target::Build,
+            BTreeMap::new(),
+            1,
+            None,
+        );
+        let mut persistent =
+            RunManyTerminal::new_persistent(&["one".to_string()], "dev", BTreeMap::new(), 1);
+
+        finite.tick().expect("finite spinner should tick");
+        persistent.tick().expect("persistent spinner should tick");
+        assert_eq!(finite.spinner_frame, 1);
+        assert_eq!(persistent.spinner_frame, 0);
+
+        persistent.spinner_advanced_at = Instant::now() - LONG_LIVED_SPINNER_INTERVAL;
+        persistent.tick().expect("persistent spinner should tick");
+        assert_eq!(persistent.spinner_frame, 1);
+    }
+
+    #[test]
+    fn keeps_persistent_rows_stopping_during_shutdown() {
+        let mut terminal =
+            RunManyTerminal::new_persistent(&["dev".to_string()], "stack", BTreeMap::new(), 1);
+        terminal.rows.get_mut("dev").unwrap().status = TaskRowStatus::Running;
+        terminal.begin_shutdown();
+
+        terminal.finish_row(&TaskOutcome {
+            project: "dev".to_string(),
+            status: TaskStatus::Succeeded,
+            cache_status: None,
+            cache_source: None,
+            remote_scope: None,
+            bytes_downloaded: 0,
+            bytes_uploaded: 0,
+            upload_result: None,
+        });
+
+        assert_eq!(terminal.rows["dev"].status, TaskRowStatus::Stopping);
+        assert_eq!(terminal.succeeded, 0);
+    }
+
+    #[test]
     fn renders_ansi_colored_logs_as_styled_spans() {
-        let lines = ansi_log_lines("\x1b[32m.\x1b[39m 132 passed\n", 10);
+        let (lines, _, _) = ansi_log_lines("\x1b[32m.\x1b[39m 132 passed\n", 10, None);
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].content, ".");
@@ -1188,8 +1608,69 @@ mod tests {
         assert_eq!(lines[0].spans[1].content, " 132 passed");
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Reset));
 
-        let lines = ansi_log_lines("\x1b]0;title\x07ok", 10);
+        let (lines, _, _) = ansi_log_lines("\x1b]0;title\x07ok", 10, None);
         assert_eq!(lines[0].spans[0].content, "ok");
+    }
+
+    #[test]
+    fn scrolls_fullscreen_logs_without_changing_tasks() {
+        let mut terminal = RunManyTerminal::new_persistent(
+            &["one".to_string(), "two".to_string()],
+            "stack",
+            BTreeMap::new(),
+            2,
+        );
+        terminal.fullscreen_logs = true;
+        terminal.log_line_count = 10;
+        terminal.log_viewport_lines = 4;
+
+        terminal.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        terminal.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(terminal.selected_index, 0);
+        assert_eq!(terminal.log_scroll_end, Some(8));
+
+        terminal.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(terminal.selected_index, 0);
+        assert_eq!(terminal.log_scroll_end, Some(9));
+
+        terminal.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(terminal.selected_index, 1);
+        assert_eq!(terminal.log_scroll_end, None);
+    }
+
+    #[test]
+    fn renders_scrolled_log_window() {
+        let (lines, line_count, end) = ansi_log_lines("one\ntwo\nthree\nfour\n", 2, Some(3));
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["two", "three"]);
+        assert_eq!(line_count, 4);
+        assert_eq!(end, 3);
+
+        let (lines, line_count, end) = ansi_log_lines("one\ntwo\n", 2, Some(usize::MAX));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_count, 2);
+        assert_eq!(end, 2);
+    }
+
+    #[test]
+    fn keeps_scrolled_log_window_stable_as_logs_grow() {
+        let (before, _, end) = ansi_log_lines("one\ntwo\nthree\nfour\n", 2, Some(3));
+        let (after, _, _) = ansi_log_lines("one\ntwo\nthree\nfour\nfive\n", 2, Some(end));
+
+        let visible = |lines: Vec<Line<'static>>| {
+            lines
+                .into_iter()
+                .flat_map(|line| line.spans)
+                .map(|span| span.content.into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(before), ["two", "three"]);
+        assert_eq!(visible(after), ["two", "three"]);
     }
 
     #[test]
@@ -1256,7 +1737,8 @@ mod tests {
         assert_eq!(
             terminal
                 .next_key(Duration::from_millis(0))
-                .expect("input should be read"),
+                .expect("input should be read")
+                .map(|key| key.code),
             Some(KeyCode::Down)
         );
     }

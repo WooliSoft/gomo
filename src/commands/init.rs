@@ -376,6 +376,7 @@ mod tests {
                 ci: true,
                 tui: false,
                 terminal_width: None,
+                surface: None,
             },
         )
         .expect("JSON init should succeed");
